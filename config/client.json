@@ -1,0 +1,19 @@
+{
+  "outbox_dir": "/outbox",
+  "uploaded_dir": "/uploaded",
+  "server_url": "https://maryrose-rejoiceful-avah.ngrok-free.dev",
+  "max_retries": 3,
+  "retry_delay": 300,
+  "poll_interval": 10,
+
+  "recording": {
+    "enabled": true,
+    "device": "plughw:1,0",
+    "chunk_duration": 60,
+    "sample_rate": 44100,
+    "channels": 1,
+    "bitrate_kbps": 128,
+    "ffmpeg_path": "ffmpeg",
+    "min_size_bytes": 1024
+  }
+}
