@@ -6,14 +6,18 @@
   "retry_delay": 300,
   "poll_interval": 10,
 
+  "gsm_device": "/dev/serial0",
+  "gsm_pin": "0427",
+
   "recording": {
     "enabled": true,
-    "device": "plughw:1,0",
-    "chunk_duration": 60,
-    "sample_rate": 44100,
-    "channels": 1,
-    "bitrate_kbps": 128,
-    "ffmpeg_path": "ffmpeg",
+    "camera_id": 0,
+    "chunk_duration": 10,
+    "width": 1920,
+    "height": 1080,
+    "framerate": 30,
+    "bitrate": "5Mbps",
+    "rpicam_vid_path": "rpicam-vid",
     "min_size_bytes": 1024
   }
 }

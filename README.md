@@ -1,388 +1,62 @@
-# Monitoring Pipeline - Video Upload System
+# Monitoring Pipeline (Edge Device)
 
-A distributed monitoring system that automatically detects, uploads, and archives video files from a Raspberry Pi to a remote server.
+This README is for the Raspberry Pi (or other edge device) that records and uploads video/audio. It does **not** cover the server side – only the client.
 
-## Architecture
+## First-time setup
 
-```
-Pi (Uploader Client)          Server
-┌─────────────────────┐    ┌──────────────────┐
-│  /outbox/           │    │  HTTP Server     │
-│  ├─ video1.mp4      │    │  on port 5000    │
-│  └─ video2.mp4      │    │                  │
-│         ↓           │    │  /upload endpoint│
-│  Uploader Loop      │────┤→ Validates       │
-│  (watches, retries) │    │→ Saves to disk   │
-│         ↓           │    │→ Returns 200 OK  │
-│  /uploaded/         │←───┤                  │
-│  ├─ video1.mp4      │    │                  │
-│  └─ video2.mp4      │    │ /srv/monitoring  │
-└─────────────────────┘    │   /uploads/      │
-                           └──────────────────┘
-```
-
-## Features
-
-- **Automatic Detection**: Monitors `/outbox/` directory for new video files
-- **Retry Logic**: Automatically retries failed uploads with configurable delays
-- **File Organization**: Moves uploaded files to `/uploaded/` on success
-- **Logging**: Comprehensive logging to syslog and file
-- **Systemd Integration**: Starts automatically on device boot
-- **Server Validation**: File type validation and size limits
-- **Health Checks**: Built-in endpoints for monitoring
-
-## Installation
-
-### Prerequisites
-
-- Python 3.7+
-- pip3
-- Root access (for systemd installation)
-
-### Pi Client Setup
-
-1. Copy the monitoring-pipeline directory to `/opt/monitoring-pipeline` on your Pi:
+1. **Copy the project** to the Pi and make it owned by a normal user:
    ```bash
    sudo cp -r monitoring-pipeline /opt/monitoring-pipeline
-   sudo chown -R monitoring:monitoring /opt/monitoring-pipeline
+   sudo chown -R $(whoami) /opt/monitoring-pipeline
    ```
 
-2. Install requirements:
+2. **Create the work directories** (these are the defaults, you can change them later):
+   ```bash
+   mkdir -p /outbox /uploaded
+   ```
+
+3. **Install system requirements**:
    ```bash
    cd /opt/monitoring-pipeline
-   sudo bash install.sh
+   sudo bash install.sh          # installs python deps and sets up venv
    ```
 
-3. Edit the configuration to point to your server:
-   ```bash
-   sudo nano /opt/monitoring-pipeline/config/client.json
-   ```
-   
-   Update `server_url` to your server's IP and port:
-   ```json
-   {
-     "server_url": "http://192.168.1.100:5000"
-   }
-   ```
+4. **Edit the config file** at `/opt/monitoring-pipeline/config/client.json` and set at least the `server_url` entry to point at your server. You can also tune polling/retry settings.
 
-4. Enable and start the services:
-   ```bash
-   sudo systemctl enable monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
-   sudo systemctl start monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
-   sudo systemctl status monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
-   ```
+5. **(Optional) enable recording** by adding a `recording` section in the same JSON. See the "Recorder" section below.
 
-5. Check logs:
-   ```bash
-   sudo journalctl -u monitoring-pipeline-uploader.service -u monitoring-pipeline-recorder.service -f
-   ```
 
-### Server Setup
+## Quick start – client side
 
-1. Install dependencies:
-   ```bash
-   pip3 install flask
-   ```
-
-2. Create upload directory:
-   ```bash
-   sudo mkdir -p /srv/monitoring-pipeline/uploads
-   sudo chown monitoring:monitoring /srv/monitoring-pipeline/uploads
-   ```
-
-3. Copy service file and start:
-   ```bash
-   sudo cp monitoring-pipeline/systemd/monitoring-pipeline-server.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   sudo systemctl enable monitoring-pipeline-server.service
-   sudo systemctl start monitoring-pipeline-server.service
-   ```
-
-4. Test the server:
-   ```bash
-   curl http://localhost:5000/health
-   curl http://localhost:5000/stats
-   ```
-
-## Configuration
-
-### Client Configuration (`/opt/monitoring-pipeline/config/client.json`) 
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `outbox_dir` | `/outbox` | Directory to monitor for videos |
-| `uploaded_dir` | `/uploaded` | Directory to move uploaded files |
-| `server_url` | `http://localhost:5000` | Server endpoint URL |
-| `max_retries` | `3` | Number of upload retry attempts |
-| `retry_delay` | `300` | Seconds to wait between retries |
-| `poll_interval` | `10` | Seconds between checking for new files |
-
-### Server Configuration
-
-Environment variables (set in systemd service):
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `UPLOAD_DIR` | `/srv/monitoring-pipeline/uploads` | Where to save uploaded files |
-
-## Directory Structure
-
-On Pi:
-```
-/outbox/              # Monitors this directory
-├─ video1.mp4
-├─ video2.mp4
-└─ video3.avi
-
-/uploaded/            # Successfully uploaded files
-├─ video1.mp4
-└─ video2.mp4
-```
-
-On Server:
-```
-/srv/monitoring-pipeline/uploads/
-├─ 20231215_143022_video1.mp4
-├─ 20231215_150145_video2.mp4
-└─ 20231216_082330_video3.avi
-```
-
-## API Endpoints
-
-### Upload Video
-```http
-POST /upload
-Content-Type: multipart/form-data
-
-file: <binary video data>
-```
-
-**Success Response (200):**
-```json
-{
-  "status": "OK",
-  "message": "File uploaded successfully",
-  "filename": "20231215_143022_video1.mp4",
-  "size": 1048576
-}
-```
-
-**Error Responses:**
-- `400`: Missing file, empty filename, or unsupported format
-- `413`: File too large (>500MB)
-- `500`: Server error
-
-### Health Check
-```http
-GET /health
-```
-
-Response:
-```json
-{
-  "status": "OK",
-  "service": "monitoring-pipeline-server"
-}
-```
-
-### Statistics
-```http
-GET /stats
-```
-
-Response:
-```json
-{
-  "status": "OK",
-  "files_count": 42,
-  "total_size_mb": 12345.67,
-  "upload_dir": "/srv/monitoring-pipeline/uploads"
-}
-```
-
-## Workflow Details
-
-### Upload Loop (Client Side)
-
-1. **Poll** - Check `/outbox/` every 10 seconds (configurable)
-2. **Select** - Pick the oldest file/directory
-3. **Upload** - Send HTTP POST to server
-4. **Retry** - If failed, wait 5 minutes and retry (up to 3 times)
-5. **Archive** - On success, move to `/uploaded/` directory
-6. **Repeat** - Go back to step 1
-
-### Server Processing
-
-1. **Receive** - Accept multipart file upload
-2. **Validate** - Check file extension and size
-3. **Save** - Write file to disk with timestamp prefix
-4. **Confirm** - Return 200 OK status
-5. **Log** - Record transaction in logs
-
-## Troubleshooting
-
-### Client not uploading
-
-1. Check service status:
-   ```bash
-   sudo systemctl status monitoring-pipeline-uploader.service
-   ```
-
-2. Check logs:
-   ```bash
-   sudo journalctl -u monitoring-pipeline-uploader.service -n 50
-   ```
-
-3. Verify network connectivity:
-   ```bash
-   curl http://[server-ip]:5000/health
-   ```
-
-4. Check file permissions:
-   ```bash
-   ls -la /outbox/
-   ls -la /uploaded/
-   ```
-
-5. Test manual upload:
-   ```bash
-   curl -F "file=@/outbox/test.mp4" http://[server-ip]:5000/upload
-   ```
-
-### Server not receiving files
-
-1. Check server status:
-   ```bash
-   sudo systemctl status monitoring-pipeline-server.service
-   ```
-
-2. Check logs:
-   ```bash
-   sudo journalctl -u monitoring-pipeline-server.service -n 50
-   ```
-
-3. Verify upload directory exists:
-   ```bash
-   ls -la /srv/monitoring-pipeline/uploads/
-   ```
-
-4. Check disk space:
-   ```bash
-   df -h /srv/monitoring-pipeline/
-   ```
-
-5. Test endpoint:
-   ```bash
-   curl http://localhost:5000/health
-   ```
-
-## Security Considerations
-
-- Services run with limited permissions (non-root `monitoring` user)
-- File extensions are validated (only video formats allowed)
-- File size is limited to 500MB
-- Systemd services use strict security settings (`ProtectSystem`, `ProtectHome`)
-- All uploads are timestamped to prevent overwrites
-- Logs are written to syslog for audit trails
-
-## Logs
-
-Logs are stored in:
-- Client: `/var/log/monitoring-pipeline.log` and systemd journal
-- Server: `/var/log/monitoring-pipeline-server.log` and systemd journal
-
-View systemd logs:
-```bash
-# Real-time client logs
-sudo journalctl -u monitoring-pipeline-uploader.service -f
-
-# Real-time server logs
-sudo journalctl -u monitoring-pipeline-server.service -f
-
-# Last 100 lines of client logs
-sudo journalctl -u monitoring-pipeline-uploader.service -n 100
-
-# Logs from the last hour
-sudo journalctl -u monitoring-pipeline-uploader.service --since "1 hour ago"
-```
-
-## Performance Tuning
-
-Adjust these parameters in `/opt/monitoring-pipeline/config/client.json`:
-
-- **`poll_interval`**: Smaller value = faster detection (but more CPU). Recommend 10-30 seconds.
-- **`retry_delay`**: Shorter delay = faster retry, but more network traffic. Recommend 300-600 seconds.
-- **`max_retries`**: More retries = better reliability but longer wait times. Recommend 3-5.
-
-For high-volume scenarios:
-```json
-{
-  "poll_interval": 5,
-  "retry_delay": 120,
-  "max_retries": 5
-}
-```
-
-## Development & Testing
-
-### Test Upload Manually
+With the prerequisites done you can enable and start the services:
 
 ```bash
-# Create a test file
-dd if=/dev/zero of=/outbox/test.mp4 bs=1M count=10
-
-# Watch the upload
-sudo journalctl -u monitoring-pipeline-uploader.service -f
-
-# Verify server received it
-sudo ls -la /srv/monitoring-pipeline/uploads/
+sudo systemctl daemon-reload
+sudo systemctl enable monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
+sudo systemctl start monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
 ```
 
-### Run Components Locally (for debugging)
+View the logs to see what the services are doing:
 
 ```bash
-# Terminal 1: Start server
-python3 monitoring-pipeline/server/server.py
+# follow uploader activity
+journalctl -u monitoring-pipeline-uploader.service -f
 
-# Terminal 2: Start client
-python3 monitoring-pipeline/pi-client/uploader.py
-
-# Terminal 3: Test upload
-dd if=/dev/zero of=/outbox/test.mp4 bs=1M count=10
+# in another terminal follow recorder activity (if enabled)
+journalctl -u monitoring-pipeline-recorder.service -f
 ```
 
-## Maintenance
+Once the services are running, putting a video file into `/outbox` should trigger an upload within a few seconds; the file will then appear in `/uploaded`.
 
-### Log Rotation
+> **Tip:** if you ever reboot the Pi the services will start automatically, so following the first‑time setup above will leave the device running on its own.
 
-Add to `/etc/logrotate.d/monitoring-pipeline`:
-```
-/var/log/monitoring-pipeline.log
-/var/log/monitoring-pipeline-server.log
-{
-    weekly
-    rotate 4
-    compress
-    missingok
-    notifempty
-}
-```
 
-### Cleanup Old Uploads
+## Recorder (audio/video capture)
 
-```bash
-# Find and delete files older than 30 days
-find /srv/monitoring-pipeline/uploads -type f -mtime +30 -delete
+The recorder service can create timestamped MP4 chunks from a camera or microphone and put them in `/outbox` automatically.
 
-# Or archive instead
-find /srv/monitoring-pipeline/uploads -type f -mtime +30 | tar czf backup-$(date +%Y%m%d).tar.gz -T -
-```
+To enable it, add this block to `client.json`:
 
-## Audio Recording (Pi)
-
-The Pi client can record audio from a microphone into timestamped MP4 chunks and drop them into the `outbox` directory so the uploader will pick them up and send them to the server.
-
-Configuration (add to `/opt/monitoring-pipeline/config/client.json` under the `recording` key):
 ```json
 "recording": {
   "enabled": true,
@@ -396,26 +70,62 @@ Configuration (add to `/opt/monitoring-pipeline/config/client.json` under the `r
 }
 ```
 
-Defaults:
-- `chunk_duration`: 60 seconds (adjust to your needs)
-- `device`: ALSA device (e.g., `hw:0`)
-- `ffmpeg_path`: path to ffmpeg binary
+Defaults are mostly sensible; change `chunk_duration` or `device` as needed. Make sure `ffmpeg` is installed (`sudo apt install ffmpeg`).
 
-Systemd service (copy `systemd/monitoring-pipeline-recorder.service` to `/etc/systemd/system/` then enable and start):
-```bash
-sudo cp monitoring-pipeline/systemd/monitoring-pipeline-recorder.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable monitoring-pipeline-recorder.service
-sudo systemctl start monitoring-pipeline-recorder.service
-sudo journalctl -u monitoring-pipeline-recorder.service -f
+The recorder writes `.tmp` files while recording and renames them to `.mp4` when done; the uploader ignores files ending in `.tmp`.
+
+
+## Configuration overview
+
+The client uses a JSON file at `/opt/monitoring-pipeline/config/client.json`.
+
+Example:
+```json
+{
+  "outbox_dir": "/outbox",
+  "uploaded_dir": "/uploaded",
+  "server_url": "http://localhost:5000",
+  "poll_interval": 10,
+  "retry_delay": 300,
+  "max_retries": 3
+}
 ```
 
-Notes:
-- `ffmpeg` must be installed on the Pi (`sudo apt install ffmpeg`).
-- The recorder writes temporary files with `.tmp` suffix and renames them to `.mp4` on successful completion.
-- If you want to disable recording, set `recording.enabled` to `false`.
+See the file itself for comments and other options (GSM modem settings, etc.).
 
----
+
+## Testing and troubleshooting
+
+- You can **stop**, **start** or **restart** the services while debugging:
+  ```bash
+  sudo systemctl stop monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
+  sudo systemctl start monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
+  sudo systemctl restart monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
+  ```
+  use `status` to check their state.
+
+- Test a manual upload:
+  ```bash
+  curl -F "file=@/outbox/test.mp4" http://SERVER:5000/upload
+  ```
+- If uploads stop:
+  * Ensure uploader service is active (`systemctl status`).
+  * Check `/outbox` and `/uploaded` permissions (`ls -la`).
+  * Verify the server address is correct (`curl /health`).
+- Logs are available with `journalctl` for both services.
+
+
+## Notes
+
+- Services run as the owner of `/opt/monitoring-pipeline`; you do not need a special user.
+- The recorder is optional; leave `recording.enabled` set to `false` to disable.
+- **GSM modem**: at present the uploader expects a working GSM modem (configured via `gsm_device` and `gsm_pin` in the JSON). If no modem is attached the service will exit with a runtime error like
+  ````
+  RuntimeError: GSM modem initialization failed - cannot proceed without GSM
+  ````
+  Make sure the hardware is present and the device path is correct.
+- This device should always be able to reach the server (via wifi, ethernet, or GSM).
+
 
 ## License
 

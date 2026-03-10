@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Pi Monitoring Pipeline - Audio Recorder
-Records audio from a microphone in fixed-duration MP4 chunks and writes them to the outbox.
+Pi Monitoring Pipeline - Video Recorder
+Records video from camera in fixed-duration MP4 chunks using libcamera and writes them to the outbox.
 
 Design:
-- Uses `ffmpeg` (external dependency) to record ALSA device directly to MP4 with AAC audio.
+- Uses `rpicam-vid` (libcamera command-line tool) to record video directly to MP4.
 - Writes to a temporary filename (".tmp") then renames atomically to `.mp4` when the chunk completes.
 - Configurable via a JSON config file or CLI args.
 """
@@ -45,15 +45,16 @@ signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 
 
-class AudioRecorder:
+class VideoRecorder:
     def __init__(self, config):
         self.outbox_dir = Path(config.get('outbox_dir', '/outbox'))
-        self.device = config.get('device', 'plughw:1,0')
         self.chunk_duration = int(config.get('chunk_duration', 60))  # seconds
-        self.sample_rate = int(config.get('sample_rate', 44100))
-        self.channels = int(config.get('channels', 1))
-        self.bitrate_kbps = int(config.get('bitrate_kbps', 128))
-        self.ffmpeg_path = config.get('ffmpeg_path', 'ffmpeg')
+        self.bitrate = config.get('bitrate', '5Mbps')  # libcamera format: e.g. "5Mbps"
+        self.width = int(config.get('width', 1920))
+        self.height = int(config.get('height', 1080))
+        self.framerate = int(config.get('framerate', 30))
+        self.camera_id = int(config.get('camera_id', 0))  # Camera index
+        self.rpicam_vid_path = config.get('rpicam_vid_path', 'rpicam-vid')
         self.min_size_bytes = int(config.get('min_size_bytes', 1024))
         self.mode = config.get('mode', 'segment')
 
@@ -65,76 +66,71 @@ class AudioRecorder:
 
         logger.info(f"Recorder initialized. outbox: {self.outbox_dir}")
         logger.info(
-            f"Mode: {self.mode}; Device: {self.device}, chunk: {self.chunk_duration}s, sr: {self.sample_rate}, ch: {self.channels}, bitrate: {self.bitrate_kbps}kbps"
+            f"Mode: {self.mode}; Camera: {self.camera_id}, chunk: {self.chunk_duration}s, resolution: {self.width}x{self.height}, fps: {self.framerate}, bitrate: {self.bitrate}"
         )
 
     def _make_filename(self):
         now = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
-        return f"audio_{now}.mp4"
+        return f"video_{now}.mp4"
 
-    def _run_ffmpeg(self, tmp_path: Path) -> int:
+    def _run_rpicam_vid(self, tmp_path: Path) -> int:
         cmd = [
-            self.ffmpeg_path,
-            '-f', 'alsa',
-            '-ac', str(self.channels),
-            '-ar', str(self.sample_rate),
-            '-i', self.device,
-            '-map', '0:a',
-            '-t', str(self.chunk_duration),
-            '-c:a', 'aac',
-            '-b:a', f"{self.bitrate_kbps}k",
-            '-y',  # overwrite if exists
-            str(tmp_path)
+            self.rpicam_vid_path,
+            '--camera', str(self.camera_id),
+            '--width', str(self.width),
+            '--height', str(self.height),
+            '--framerate', str(self.framerate),
+            '--bitrate', self.bitrate,
+            '--timeout', str(self.chunk_duration * 1000),  # rpicam-vid uses milliseconds
+            '--codec', 'h264',
+            '-o', str(tmp_path)
         ]
 
-        logger.info(f"Starting ffmpeg: {' '.join(cmd)}")
+        logger.info(f"Starting rpicam-vid: {' '.join(cmd)}")
         try:
-            # Run ffmpeg and wait until chunk is recorded
+            # Run rpicam-vid and wait until chunk is recorded
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             out, err = proc.communicate()
             if proc.returncode != 0:
-                logger.error(f"ffmpeg failed (code {proc.returncode}): {err.decode(errors='ignore')}" )
+                logger.error(f"rpicam-vid failed (code {proc.returncode}): {err.decode(errors='ignore')}" )
             return proc.returncode
         except FileNotFoundError:
-            logger.critical(f"ffmpeg not found at '{self.ffmpeg_path}'. Please install ffmpeg or set ffmpeg_path.")
+            logger.critical(f"rpicam-vid not found at '{self.rpicam_vid_path}'. Please install libcamera-apps or set rpicam_vid_path.")
             return 127
         except Exception as e:
-            logger.error(f"Error running ffmpeg: {e}")
+            logger.error(f"Error running rpicam-vid: {e}")
             return 1
 
     def start(self):
         self._start_segment_mode()
 
     def _start_segment_mode(self):
-        """Run a persistent ffmpeg process that writes segmented `.mp4.tmp` files, and
-        finalize them by renaming to `.mp4` once they are stable."""
-        pattern = str(self.outbox_dir / "audio_%Y%m%dT%H%M%SZ.mp4.tmp")
-        cmd = [
-            self.ffmpeg_path,
-            '-f', 'alsa',
-            '-ac', str(self.channels),
-            '-ar', str(self.sample_rate),
-            '-i', self.device,  # already set to plughw
-            '-map', '0:a',  # ensure audio stream is selected for segment outputs
-            '-c:a', 'aac',
-            '-b:a', f"{self.bitrate_kbps}k",
-            '-f', 'segment',
-            '-segment_time', str(self.chunk_duration),
-            '-segment_format', 'mp4',
-            '-reset_timestamps', '1',
-            '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
-            '-strftime', '1',
-            pattern
-        ]
-
-        logger.info(f"Starting ffmpeg segmenter: {' '.join(cmd)}")
+        """Run rpicam-vid to record MP4 video chunks.
+        Writes segmented `.mp4.tmp` files, and finalizes them by renaming to `.mp4` once stable."""
+        logger.info(f"Starting video recorder with {self.chunk_duration}s chunks")
         restart_delay = 5
 
         while not STOP_FLAG:
             try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except FileNotFoundError:
-                logger.critical(f"ffmpeg not found at '{self.ffmpeg_path}'. Please install ffmpeg or set ffmpeg_path.")
+                tmp_path = self.outbox_dir / self._make_filename().replace('.mp4', '.mp4.tmp')
+                
+                # Record directly to MP4
+                rpicam_cmd = [
+                    self.rpicam_vid_path,
+                    '--camera', str(self.camera_id),
+                    '--width', str(self.width),
+                    '--height', str(self.height),
+                    '--framerate', str(self.framerate),
+                    '--bitrate', self.bitrate,
+                    '--timeout', str(self.chunk_duration * 1000),  # milliseconds
+                    '-o', str(tmp_path)
+                ]
+                
+                logger.info(f"Recording chunk: {tmp_path.name}")
+                # Record H.264 stream
+                proc = subprocess.Popen(rpicam_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except FileNotFoundError as e:
+                logger.critical(f"rpicam-vid not found at '{self.rpicam_vid_path}'. Please install libcamera-apps.")
                 return
 
             # Start renamer helper if needed
@@ -149,26 +145,27 @@ class AudioRecorder:
                     break
                 rc = proc.poll()
                 if rc is not None:
-                    # Capture any remaining output from ffmpeg so we can see the real error
+                    # Capture any remaining output from rpicam-vid
                     try:
                         out, err = proc.communicate(timeout=5)
                         if out:
-                            logger.debug(f"ffmpeg stdout: {out.decode(errors='ignore')}")
+                            logger.debug(f"rpicam-vid stdout: {out.decode(errors='ignore')}")
                         if err:
-                            logger.error(f"ffmpeg stderr: {err.decode(errors='ignore')}")
+                            logger.debug(f"rpicam-vid stderr: {err.decode(errors='ignore')}")
                     except Exception:
-                        # If communicate fails for any reason, continue - we still restart
                         pass
 
-                    logger.error(f"ffmpeg segmenter exited with code {rc}; restarting in {restart_delay}s")
+                    if rc != 0:
+                        logger.warning(f"rpicam-vid exited with code {rc}")
+                    # Continue to next chunk
                     break
                 time.sleep(0.5)
 
-            # If stopping, ask ffmpeg to finish gracefully
+            # If stopping, ask rpicam-vid to finish gracefully
             if STOP_FLAG:
                 try:
                     proc.send_signal(signal.SIGINT)
-                    logger.info("Sent SIGINT to ffmpeg to finalize current segment")
+                    logger.info("Sent SIGINT to rpicam-vid to finalize current chunk")
                     proc.wait(timeout=10 + self.chunk_duration)
                 except Exception:
                     try:
@@ -177,12 +174,11 @@ class AudioRecorder:
                         pass
                 break
             else:
-                # Not stopping: kill and restart after a small backoff
+                # Not stopping: process exited normally or timed out, continue to next chunk
                 try:
                     proc.terminate()
                 except Exception:
                     pass
-                time.sleep(restart_delay)
 
         # Stopping: stop renamer and run final pass
         self._renamer_stop.set()
@@ -234,12 +230,13 @@ def load_config(path: str = None):
     # Merge recording defaults
     rec = cfg.get('recording', {})
     defaults = {
-        'device': 'hw:0',
+        'camera_id': 0,
         'chunk_duration': 60,
-        'sample_rate': 44100,
-        'channels': 1,
-        'bitrate_kbps': 128,
-        'ffmpeg_path': 'ffmpeg',
+        'width': 1920,
+        'height': 1080,
+        'framerate': 30,
+        'bitrate': '5Mbps',
+        'rpicam_vid_path': 'rpicam-vid',
         'min_size_bytes': 1024,
         'mode': 'segment'
     }
@@ -261,7 +258,7 @@ if __name__ == '__main__':
         cfg_path = sys.argv[2]
 
     config = load_config(cfg_path)
-    recorder = AudioRecorder(config)
+    recorder = VideoRecorder(config)
     try:
         recorder.start()
     except KeyboardInterrupt:

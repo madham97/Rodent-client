@@ -21,20 +21,14 @@ python3 -m venv /opt/monitoring-pipeline/venv
 source /opt/monitoring-pipeline/venv/bin/activate
 echo "Installing Python requirements..."
 pip install --upgrade pip
-pip install flask requests
-
-# Create user for services (if not exists)
-if ! id -u monitoring > /dev/null 2>&1; then
-    echo "Creating 'monitoring' user..."
-    useradd -r -s /bin/bash -d /opt/monitoring-pipeline monitoring
-fi
+pip install flask requests pyserial
 
 # Create necessary directories
 mkdir -p /outbox /uploaded
 mkdir -p /var/log
 
-# Set permissions
-chown -R monitoring:monitoring /outbox /uploaded /opt/monitoring-pipeline/venv
+# Set permissions (owned by current user)
+chown -R $(whoami) /outbox /uploaded /opt/monitoring-pipeline/venv
 chmod 755 /outbox /uploaded
 
 # Copy service files
@@ -54,9 +48,13 @@ fi
 echo "Installation complete!"
 echo ""
 echo "Next steps:"
-echo "  1. Edit /opt/monitoring-pipeline/config/client.json with your server IP"
-echo "  2. systemctl enable monitoring-pipeline-uploader.service"
-echo "  3. systemctl enable monitoring-pipeline-recorder.service"
-echo "  4. systemctl start monitoring-pipeline-uploader.service"
-echo "  5. systemctl start monitoring-pipeline-recorder.service"
-echo "  6. systemctl status monitoring-pipeline-uploader.service && systemctl status monitoring-pipeline-recorder.service"
+echo "  1. Edit /opt/monitoring-pipeline/config/client.json to set:"
+echo "     - server_url: your server IP and port (e.g., http://192.168.1.100:5000)"
+echo "     - gsm_device: device path for GSM modem (default: /dev/serial0)"
+echo "     - gsm_pin: SIM card PIN if needed"
+echo "     - recording: enable audio/video recording settings"
+echo "  2. sudo systemctl daemon-reload"
+echo "  3. sudo systemctl enable monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service"
+echo "  4. sudo systemctl start monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service"
+echo "  5. journalctl -u monitoring-pipeline-uploader.service -f     # watch uploader logs"
+echo "  6. journalctl -u monitoring-pipeline-recorder.service -f     # watch recorder logs"
