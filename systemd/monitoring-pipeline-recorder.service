@@ -1,0 +1,24 @@
+[Unit]
+Description=Monitoring Pipeline - Audio Recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monitoring
+Group=monitoring
+WorkingDirectory=/opt/monitoring-pipeline
+ExecStart=/opt/monitoring-pipeline/venv/bin/python3 /opt/monitoring-pipeline/pi-client/recorder.py --config /opt/monitoring-pipeline/config/client.json
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security settings
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/outbox /var/log
+
+[Install]
+WantedBy=multi-user.target

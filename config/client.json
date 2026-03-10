@@ -1,0 +1,23 @@
+{
+  "outbox_dir": "/outbox",
+  "uploaded_dir": "/uploaded",
+  "server_url": "https://maryrose-rejoiceful-avah.ngrok-free.dev",
+  "max_retries": 3,
+  "retry_delay": 300,
+  "poll_interval": 10,
+
+  "gsm_device": "/dev/serial0",
+  "gsm_pin": "0427",
+
+  "recording": {
+    "enabled": true,
+    "camera_id": 0,
+    "chunk_duration": 10,
+    "width": 1920,
+    "height": 1080,
+    "framerate": 30,
+    "bitrate": "5Mbps",
+    "rpicam_vid_path": "rpicam-vid",
+    "min_size_bytes": 1024
+  }
+}
