@@ -122,13 +122,6 @@ class VideoUploader:
         
         # Initialize GSM (required)
         self.gsm_modem = GSMModem(device=self.gsm_device, pin=self.gsm_pin)
-        if not self.gsm_modem.initialize():
-            logger.error("FATAL: GSM modem initialization failed")
-            raise RuntimeError("GSM modem initialization failed - cannot proceed without GSM")
-        
-        logger.info(f"GSM modem initialized and connected")
-        signal = self.gsm_modem.get_signal_strength()
-        logger.info(f"GSM signal strength: {signal}/31")
         
         logger.info(f"Uploader initialized. Server: {self.server_url}")
         logger.info(f"Outbox: {self.outbox_dir}, Uploaded: {self.uploaded_dir}")
@@ -239,6 +232,15 @@ class VideoUploader:
     def run(self):
         """Main loop - continuously monitor and upload."""
         logger.info("Starting monitoring pipeline...")
+        
+        # Ensure GSM modem is initialized
+        while not self.gsm_modem.initialize():
+            logger.info("GSM modem initialization failed, retrying in 10 seconds...")
+            time.sleep(10)
+        
+        logger.info(f"GSM modem initialized and connected")
+        signal = self.gsm_modem.get_signal_strength()
+        logger.info(f"GSM signal strength: {signal}/31")
         
         try:
             while True:
