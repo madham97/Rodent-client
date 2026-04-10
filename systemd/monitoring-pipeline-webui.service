@@ -1,12 +1,13 @@
 [Unit]
-Description=Monitoring Pipeline - Audio Recorder
+Description=Monitoring Pipeline - Web UI
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/monitoring-pipeline
-ExecStart=/opt/monitoring-pipeline/venv/bin/python3 /opt/monitoring-pipeline/pi-client/recorder.py --config /opt/monitoring-pipeline/config/client.json
+EnvironmentFile=/opt/monitoring-pipeline/config/webui.env
+ExecStart=/opt/monitoring-pipeline/venv/bin/python3 /opt/monitoring-pipeline/pi-client/web_ui.py
 Restart=always
 RestartSec=10
 StandardOutput=journal

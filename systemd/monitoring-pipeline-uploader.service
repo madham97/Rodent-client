@@ -1,24 +1,15 @@
 [Unit]
-Description=Monitoring Pipeline - Video Uploader Client
-After=network-online.target
-Wants=network-online.target
+Description=Monitoring Pipeline - Uploader
+After=network.target
 
 [Service]
 Type=simple
-User=monitoring
-Group=monitoring
 WorkingDirectory=/opt/monitoring-pipeline
 ExecStart=/opt/monitoring-pipeline/venv/bin/python3 /opt/monitoring-pipeline/pi-client/uploader.py
 Restart=always
 RestartSec=30
 StandardOutput=journal
 StandardError=journal
-
-# Security settings
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/outbox /uploaded /var/log
 
 [Install]
 WantedBy=multi-user.target

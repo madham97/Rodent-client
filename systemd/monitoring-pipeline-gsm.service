@@ -1,0 +1,15 @@
+[Unit]
+Description=Monitoring Pipeline - GSM Data Connection (pppd)
+After=monitoring-pipeline-gsm-pin.service
+Requires=monitoring-pipeline-gsm-pin.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/pppd call gsm nodetach
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
