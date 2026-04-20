@@ -39,7 +39,8 @@ def _to_webp(file_path: Path, quality: int) -> tuple[bytes, str]:
         return buf.getvalue(), file_path.stem + '.webp'
 
 
-def build_multipart(file_path: Path, webp_compress: bool = False, webp_quality: int = 80) -> bytes:
+def build_multipart(file_path: Path, webp_compress: bool = False, webp_quality: int = 80,
+                    metadata: dict = None) -> bytes:
     """Wrap file in a multipart/form-data body. Optionally re-encodes JPEGs as WebP for smaller transfer."""
     is_image = file_path.suffix.lower() in ('.jpg', '.jpeg')
     if is_image and webp_compress:
@@ -50,14 +51,23 @@ def build_multipart(file_path: Path, webp_compress: bool = False, webp_quality: 
         data, filename = file_path.read_bytes(), file_path.name
         field        = 'image' if is_image else 'video'
         content_type = 'image/jpeg' if is_image else 'video/mp4'
-    header = (
+    parts = [(
         f'--{BOUNDARY}\r\n'
         f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
         f'Content-Type: {content_type}\r\n'
         f'\r\n'
-    ).encode()
-    footer = f'\r\n--{BOUNDARY}--\r\n'.encode()
-    return header + data + footer
+    ).encode() + data]
+    for key, value in (metadata or {}).items():
+        if value is None:
+            continue
+        parts.append((
+            f'\r\n--{BOUNDARY}\r\n'
+            f'Content-Disposition: form-data; name="{key}"\r\n'
+            f'\r\n'
+            f'{value}'
+        ).encode())
+    parts.append(f'\r\n--{BOUNDARY}--\r\n'.encode())
+    return b''.join(parts)
 
 
 class SIM800:
@@ -158,6 +168,7 @@ class SIM800:
             return False
         if not self.wait_registered():
             return False
+        self.enable_sms_text_mode()
         logger.info(f"Modem ready. Signal: {self.get_signal()}/31")
         return True
 
@@ -169,6 +180,45 @@ class SIM800:
         except Exception:
             pass
         return 0
+
+    # ── SMS ────────────────────────────────────────────────────────────────────
+
+    def enable_sms_text_mode(self):
+        """Switch to text mode so SMS bodies are human-readable strings."""
+        resp = self._send('AT+CMGF=1', wait=0.5)
+        if 'OK' in resp:
+            logger.info("SMS text mode enabled")
+        else:
+            logger.warning(f"SMS text mode failed: {resp!r}")
+
+    def read_sms(self) -> list[tuple[int, str, str]]:
+        """Read all unread SMS messages. Returns list of (index, sender, body)."""
+        resp = self._send('AT+CMGL="REC UNREAD"', wait=2)
+        messages = []
+        lines = resp.splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith('+CMGL:'):
+                try:
+                    # +CMGL: <index>,"REC UNREAD","<sender>","","<timestamp>"
+                    parts = line[len('+CMGL:'):].split(',')
+                    index = int(parts[0].strip())
+                    sender = parts[2].strip().strip('"')
+                    # next non-empty line is the message body
+                    i += 1
+                    while i < len(lines) and not lines[i].strip():
+                        i += 1
+                    body = lines[i].strip() if i < len(lines) else ''
+                    messages.append((index, sender, body))
+                except (IndexError, ValueError):
+                    pass
+            i += 1
+        return messages
+
+    def delete_sms(self, index: int):
+        """Delete a message by its SIM slot index."""
+        self._send(f'AT+CMGD={index}', wait=0.5)
 
     # ── Bearer (GPRS data connection) ──────────────────────────────────────────
 
@@ -255,8 +305,14 @@ class SIM800:
         return 0
 
 
+SMS_CHECK_INTERVAL = 60  # seconds between SMS inbox polls
+
+
 class Uploader:
-    def __init__(self, config):
+    def __init__(self, config, config_path=None):
+        self.config      = config
+        self.config_path = config_path
+
         self.outbox_dir    = Path(config.get('outbox_dir', '/outbox'))
         self.uploaded_dir  = Path(config.get('uploaded_dir', '/uploaded'))
         self.upload_url    = config.get('server_url', 'http://localhost:8000') + '/upload'
@@ -269,6 +325,8 @@ class Uploader:
 
         self.webp_compress = bool(config.get('webp_compress', False))
         self.webp_quality  = int(config.get('webp_quality', 80))
+
+        self._last_sms_check = 0.0
 
         self.modem = SIM800(
             device=config.get('gsm_device', '/dev/serial0'),
@@ -285,6 +343,7 @@ class Uploader:
             items = [
                 p for p in self.outbox_dir.glob('*')
                 if not p.name.endswith('.tmp')
+                and not p.name.endswith('.json')
                 and p.exists()
                 and (not p.is_file() or p.stat().st_size > 0)
             ]
@@ -309,13 +368,23 @@ class Uploader:
                 pass  # already moved externally
             return True
 
-        body         = build_multipart(file_path, self.webp_compress, self.webp_quality)
+        sidecar = file_path.with_suffix('.json')
+        metadata = None
+        if sidecar.exists():
+            try:
+                with open(sidecar) as f:
+                    metadata = json.load(f)
+            except Exception as e:
+                logger.warning(f"Could not read sidecar {sidecar.name}: {e}")
+
+        body         = build_multipart(file_path, self.webp_compress, self.webp_quality, metadata)
         content_type = f'multipart/form-data; boundary={BOUNDARY}'
 
         status = self.modem.http_post(self.upload_url, body, content_type)
         if status == 200:
             elapsed = time.time() - t0
             logger.info(f"Upload successful: {file_path.name} ({elapsed:.1f}s, {size / elapsed / 1024:.1f} KB/s)")
+            sidecar.unlink(missing_ok=True)
             return True
 
         logger.warning(f"Upload failed (HTTP {status}): {file_path.name}")
@@ -347,6 +416,70 @@ class Uploader:
         logger.error(f"Failed to upload {oldest.name} after {self.max_retries} attempts")
         return False
 
+    def _deep_merge(self, base: dict, patch: dict) -> dict:
+        """Recursively merge patch into base, returning a new dict."""
+        result = base.copy()
+        for key, value in patch.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = self._deep_merge(result[key], value)
+            else:
+                result[key] = value
+        return result
+
+    def _apply_config_patch(self, patch: dict):
+        """Merge patch into the live config, update live settings, and persist to disk."""
+        self.config = self._deep_merge(self.config, patch)
+
+        # Apply uploader settings that can take effect without a restart
+        if 'poll_interval' in patch:
+            self.poll_interval = int(patch['poll_interval'])
+        if 'max_retries' in patch:
+            self.max_retries = int(patch['max_retries'])
+        if 'retry_delay' in patch:
+            self.retry_delay = int(patch['retry_delay'])
+        if 'webp_compress' in patch:
+            self.webp_compress = bool(patch['webp_compress'])
+        if 'webp_quality' in patch:
+            self.webp_quality = int(patch['webp_quality'])
+
+        if self.config_path:
+            try:
+                with open(self.config_path, 'w') as f:
+                    json.dump(self.config, f, indent=2)
+                logger.info(f"Config saved to {self.config_path}")
+            except Exception as e:
+                logger.error(f"Failed to save config: {e}")
+
+        if any(k in patch for k in ('recording', 'gsm_device', 'gsm_apn')):
+            logger.info("Recording/GSM settings updated — restarting recorder service...")
+            try:
+                import subprocess
+                subprocess.run(
+                    ['systemctl', 'restart', 'monitoring-pipeline-recorder'],
+                    check=True, timeout=15,
+                )
+                logger.info("Recorder service restarted successfully")
+            except Exception as e:
+                logger.error(f"Failed to restart recorder service: {e}")
+
+    def _check_sms_config(self):
+        """Poll the SMS inbox and apply any JSON config patches found."""
+        messages = self.modem.read_sms()
+        for index, sender, body in messages:
+            logger.info(f"SMS from {sender}: {body!r}")
+            try:
+                patch = json.loads(body)
+                if not isinstance(patch, dict):
+                    raise ValueError("SMS body must be a JSON object")
+                self._apply_config_patch(patch)
+                logger.info(f"Config updated via SMS from {sender}: keys={list(patch.keys())}")
+            except json.JSONDecodeError:
+                logger.warning(f"SMS from {sender} is not valid JSON — ignoring")
+            except Exception as e:
+                logger.warning(f"Failed to apply SMS config from {sender}: {e}")
+            finally:
+                self.modem.delete_sms(index)
+
     def run(self):
         self.modem.open()
         try:
@@ -360,6 +493,10 @@ class Uploader:
 
             logger.info("Uploader running.")
             while True:
+                if time.time() - self._last_sms_check >= SMS_CHECK_INTERVAL:
+                    self._last_sms_check = time.time()
+                    self._check_sms_config()
+
                 processed = self._process_oldest()
                 time.sleep(2 if processed else self.poll_interval)
 
@@ -396,4 +533,4 @@ if __name__ == '__main__':
     if len(sys.argv) > 2 and sys.argv[1] == '--config':
         cfg_path = sys.argv[2]
 
-    Uploader(load_config(cfg_path)).run()
+    Uploader(load_config(cfg_path), config_path=cfg_path).run()

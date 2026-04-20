@@ -15,6 +15,7 @@ import time
 import json
 import signal
 import logging
+import socket
 import subprocess
 import threading
 from pathlib import Path
@@ -104,7 +105,7 @@ class Recorder:
     # ── Utilities ─────────────────────────────────────────────────────────────
 
     def _make_filename(self, ext='.mp4') -> str:
-        ts     = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+        ts     = datetime.now(datetime.UTC).strftime('%Y%m%dT%H%M%SZ')
         prefix = 'image' if ext.startswith('.jp') else 'video'
         return f"{prefix}_{ts}{ext}"
 
@@ -165,16 +166,28 @@ class Recorder:
             tmp.unlink(missing_ok=True)
         return False
 
-    def _frames_differ(self, avg, frame) -> bool:
-        """Return True if frame differs from running average beyond motion_threshold."""
+    def _motion_score(self, avg, frame) -> float:
+        """Return the fraction of pixels that changed significantly between avg and frame."""
         from PIL import ImageChops
-        diff  = ImageChops.difference(avg, frame)
+        diff = ImageChops.difference(avg, frame)
         # Only count pixels that changed by more than 40/255 — filters sensor noise
         # and minor lighting shifts, focuses on meaningful movement
         ratio = sum(diff.histogram()[40:]) / (frame.width * frame.height)
         if self.motion_debug:
             logger.info(f"Motion ratio: {ratio:.4f} (threshold: {self.motion_threshold})")
-        return ratio > self.motion_threshold
+        return ratio
+
+    def _write_sidecar(self, file_path: Path, motion_score: float = None):
+        """Write a JSON sidecar with capture metadata alongside file_path."""
+        meta = {
+            "timestamp":    datetime.now(datetime.UTC).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "mode":         self.mode,
+            "device_id":    socket.gethostname(),
+            "motion_score": round(motion_score, 6) if motion_score is not None else None,
+        }
+        sidecar = file_path.with_suffix('.json')
+        with open(sidecar, 'w') as f:
+            json.dump(meta, f)
 
     def _finalize_tmp(self, tmp_path: Path):
         """Wait for a .tmp file to stop growing, then rename it to its final name."""
@@ -236,9 +249,10 @@ class Recorder:
                 time.sleep(2)
                 continue
 
-            if self._frames_differ(running_avg, frame):
+            score = self._motion_score(running_avg, frame)
+            if score > self.motion_threshold:
                 logger.info("Motion detected")
-                on_motion()
+                on_motion(score)
                 if self.motion_cooldown > 0:
                     logger.info(f"Cooling down for {self.motion_cooldown}s...")
                     elapsed = 0.0
@@ -250,6 +264,7 @@ class Recorder:
             else:
                 running_avg = Image.blend(running_avg, frame, alpha=self.temporal_alpha)
                 time.sleep(self.detection_interval)
+
 
         logger.info("Motion detection stopping gracefully.")
 
@@ -371,11 +386,14 @@ class Recorder:
         """Record a video clip each time motion is detected."""
         logger.info(f"Starting motion-triggered video recorder ({self.chunk_duration}s clips)")
 
-        def on_motion():
+        def on_motion(motion_score):
             tmp_path = self.outbox_dir / self._make_filename('.mp4.tmp')
             self._record_clip(tmp_path)
             if not STOP_FLAG:
+                final = tmp_path.with_suffix('')
                 self._finalize_tmp(tmp_path)
+                if final.exists():
+                    self._write_sidecar(final, motion_score)
                 logger.info("Clip saved, resuming detection")
 
         self._motion_loop(on_motion)
@@ -388,7 +406,8 @@ class Recorder:
 
         while not STOP_FLAG:
             path = self.outbox_dir / self._make_filename('.jpg')
-            self._capture_image(path)
+            if self._capture_image(path):
+                self._write_sidecar(path)
             elapsed = 0.0
             while elapsed < self.image_interval and not STOP_FLAG:
                 time.sleep(0.5)
@@ -402,9 +421,10 @@ class Recorder:
         """Capture a JPEG each time motion is detected."""
         logger.info("Starting motion-triggered image recorder")
 
-        def on_motion():
+        def on_motion(motion_score):
             path = self.outbox_dir / self._make_filename('.jpg')
-            self._capture_image(path)
+            if self._capture_image(path):
+                self._write_sidecar(path, motion_score)
 
         self._motion_loop(on_motion)
 
