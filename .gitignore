@@ -21,6 +21,9 @@ coverage.xml
 .pytest_cache
 .hypothesis
 
+# Web UI credentials (never commit)
+config/webui.env
+
 # Temporary files
 *.tmp
 *.mp4

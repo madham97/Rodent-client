@@ -1,0 +1,14 @@
+[Unit]
+Description=Monitoring Pipeline - GSM SIM PIN Unlock
+After=sysinit.target
+Before=monitoring-pipeline-gsm.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/monitoring-pipeline/venv/bin/python3 /opt/monitoring-pipeline/scripts/gsm-pin-unlock.py
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

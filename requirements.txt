@@ -4,6 +4,7 @@ Flask==3.0.0
 requests==2.31.0
 Werkzeug==3.0.1
 pyserial==3.5
+Pillow>=10.0.0
 
 # Optional: picamera2 library for advanced camera control (requires libcamera-dev)
 # picamera2>=0.3.14
