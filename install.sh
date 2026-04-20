@@ -26,6 +26,7 @@ pip install flask requests pyserial pillow
 # Create necessary directories
 mkdir -p /outbox /uploaded
 mkdir -p /var/log
+mkdir -p /opt/monitoring-pipeline/config
 touch /var/log/monitoring-pipeline.log
 
 # Create web UI credentials file if missing
@@ -54,83 +55,55 @@ fi
 # Enable and start tailscaled (the daemon)
 systemctl enable --now tailscaled
 
-# Install ppp for GSM data connection
-echo "Installing ppp..."
-apt-get install -y ppp
+# Copy source files
+echo "Copying source files..."
+cp -r pi-client /opt/monitoring-pipeline/pi-client
+cp -r scripts   /opt/monitoring-pipeline/scripts
 
-# PPP chat script for Vodafone Germany
-mkdir -p /etc/ppp/chatscripts
-cat > /etc/ppp/chatscripts/vodafone-de << 'EOF'
-ABORT 'BUSY'
-ABORT 'NO CARRIER'
-ABORT 'NO DIALTONE'
-ABORT 'NO ANSWER'
-ABORT 'ERROR'
-TIMEOUT 30
-'' ATZ
-OK ATE0
-OK AT+CGDCONT=1,"IP","web.vodafone.de"
-OK ATD*99#
-CONNECT ''
-EOF
-chmod 640 /etc/ppp/chatscripts/vodafone-de
-
-# PPP peer config for GSM modem
-cat > /etc/ppp/peers/gsm << 'EOF'
-/dev/serial0
-115200
-noauth
-nodefaultroute
-usepeerdns
-persist
-maxfail 0
-holdoff 10
-crtscts
-lock
-connect "/usr/sbin/chat -v -f /etc/ppp/chatscripts/vodafone-de"
-EOF
-
-# ip-up script: add GSM as a lower-priority default route (metric 700)
-# so WiFi (metric 600) is preferred when both are up
-mkdir -p /etc/ppp/ip-up.d
-cat > /etc/ppp/ip-up.d/01-gsm-route << 'EOF'
-#!/bin/bash
-ip route add default dev ppp0 metric 700 2>/dev/null || true
-EOF
-chmod +x /etc/ppp/ip-up.d/01-gsm-route
-
-# Copy service files
+# Copy service files (uploader, recorder, web UI only — GSM pppd not needed)
 echo "Installing systemd services..."
-cp systemd/monitoring-pipeline-uploader.service   /etc/systemd/system/
-cp systemd/monitoring-pipeline-recorder.service   /etc/systemd/system/
-cp systemd/monitoring-pipeline-webui.service      /etc/systemd/system/
-cp systemd/monitoring-pipeline-gsm-pin.service    /etc/systemd/system/
-cp systemd/monitoring-pipeline-gsm.service        /etc/systemd/system/
+cp systemd/monitoring-pipeline-uploader.service /etc/systemd/system/
+cp systemd/monitoring-pipeline-recorder.service /etc/systemd/system/
+cp systemd/monitoring-pipeline-webui.service    /etc/systemd/system/
 systemctl daemon-reload
 
-# Copy config (if not exists) into the single-folder layout under /opt
-mkdir -p /opt/monitoring-pipeline/config
+# Enable services to start on boot
+systemctl enable monitoring-pipeline-uploader.service \
+                 monitoring-pipeline-recorder.service \
+                 monitoring-pipeline-webui.service
+
+# Copy config if not already present
 if [ ! -f /opt/monitoring-pipeline/config/client.json ]; then
     cp config/client.json /opt/monitoring-pipeline/config/client.json
-    echo "Config file created at /opt/monitoring-pipeline/config/client.json"
-    echo "Edit it to set the correct server URL!"
+    echo "Config copied to /opt/monitoring-pipeline/config/client.json"
 fi
 
-echo "Installation complete!"
 echo ""
-echo "Next steps:"
-echo "  1. Edit /opt/monitoring-pipeline/config/client.json to set:"
-echo "     - server_url: your server IP and port (e.g., http://192.168.1.100:5000)"
-echo "     - gsm_device: device path for GSM modem (default: /dev/serial0)"
-echo "     - gsm_pin: SIM card PIN if needed"
-echo "     - recording: enable audio/video recording settings"
-echo "  2. Edit config/webui.env to set a strong password"
-echo "  3. Connect the Pi to your Tailscale network:"
+echo "================================================"
+echo " Installation complete!"
+echo "================================================"
+echo ""
+echo "IMPORTANT — before starting the services:"
+echo ""
+echo "  1. Ensure the GSM HAT is powered on and the SIM card is inserted"
+echo ""
+echo "  2. Edit /opt/monitoring-pipeline/config/client.json:"
+echo "       - server_url  : URL of your server (e.g. http://192.168.1.100:8000)"
+echo "       - gsm_pin     : SIM PIN if required"
+echo "       - gsm_apn     : APN for your carrier (default: web.vodafone.de)"
+echo ""
+echo "  3. Edit /opt/monitoring-pipeline/config/webui.env — set a strong password"
+echo ""
+echo "  4. Authenticate Tailscale (required for remote web UI access):"
 echo "       sudo tailscale up"
-echo "     Follow the URL it prints to authorise the device."
-echo "     Then get its Tailscale IP:  tailscale ip -4"
-echo "  4. sudo systemctl daemon-reload"
-echo "  5. sudo systemctl enable monitoring-pipeline-recorder.service monitoring-pipeline-uploader.service monitoring-pipeline-webui.service"
-echo "  6. sudo systemctl start monitoring-pipeline-recorder.service monitoring-pipeline-uploader.service monitoring-pipeline-webui.service"
-echo "  7. Open http://<tailscale-ip>:8080 from any device on your Tailnet"
-echo "     (login: admin / monitoring  — change this in config/webui.env)"
+echo "     Open the URL it prints, then get your Tailscale IP:"
+echo "       tailscale ip -4"
+echo ""
+echo "  5. Start the services:"
+echo "       sudo systemctl start monitoring-pipeline-recorder.service \\"
+echo "                            monitoring-pipeline-uploader.service \\"
+echo "                            monitoring-pipeline-webui.service"
+echo ""
+echo "  6. Open http://<tailscale-ip>:8080 in a browser"
+echo "     (login: admin / monitoring — change this in config/webui.env)"
+echo ""

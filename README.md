@@ -1,132 +1,150 @@
-# Monitoring Pipeline (Edge Device)
+# Rodent Client — Edge Device
 
-This README is for the Raspberry Pi (or other edge device) that records and uploads video/audio. It does **not** cover the server side – only the client.
+Raspberry Pi client for the rodent monitoring pipeline. Captures motion-triggered images via camera, compresses them, and uploads over GSM (SIM800 modem) to the server. Config can be updated remotely by sending a JSON SMS to the device's SIM number.
 
-## First-time setup
+## Hardware requirements
 
-1. **Copy the project** to the Pi and make it owned by a normal user:
-   ```bash
-   sudo cp -r monitoring-pipeline /opt/monitoring-pipeline
-   sudo chown -R $(whoami) /opt/monitoring-pipeline
-   ```
+- Raspberry Pi (tested on Pi 4 Model B)
+- Camera module (compatible with `rpicam-still` / `rpicam-vid`)
+- SIM800 GSM HAT connected to GPIO UART (`/dev/serial0`)
+- SIM card with a data plan (GPRS)
 
-2. **Create the work directories** (these are the defaults, you can change them later):
-   ```bash
-   mkdir -p /outbox /uploaded
-   ```
+## Installation
 
-3. **Install system requirements**:
-   ```bash
-   cd /opt/monitoring-pipeline
-   sudo bash install.sh          # installs python deps and sets up venv
-   ```
-
-4. **Edit the config file** at `/opt/monitoring-pipeline/config/client.json` and set at least the `server_url` entry to point at your server. You can also tune polling/retry settings.
-
-5. **(Optional) enable recording** by adding a `recording` section in the same JSON. See the "Recorder" section below.
-
-
-## Quick start – client side
-
-With the prerequisites done you can enable and start the services:
+Clone the repo onto the Pi, then run the install script from the repo root:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
-sudo systemctl start monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
+cd /opt/Rodent-client
+sudo bash install.sh
 ```
 
-View the logs to see what the services are doing:
+The script will:
+- Create a Python virtualenv at `/opt/monitoring-pipeline/venv`
+- Install Python dependencies
+- Copy source files and config to `/opt/monitoring-pipeline/`
+- Install and enable Tailscale
+- Register the systemd services (uploader, recorder, web UI)
+
+## First-time configuration
+
+Edit `/opt/monitoring-pipeline/config/client.json` before starting the services:
+
+```json
+{
+  "server_url": "http://<your-server>:8000",
+  "gsm_pin":    "1234",
+  "gsm_apn":    "web.vodafone.de",
+  "outbox_dir":   "/outbox",
+  "uploaded_dir": "/uploaded",
+  "poll_interval": 10,
+  "max_retries":   3,
+  "retry_delay":   10,
+  "webp_compress": true,
+  "webp_quality":  80,
+  "recording": {
+    "enabled":           true,
+    "mode":              "image_motion",
+    "width":             1280,
+    "height":            720,
+    "framerate":         15,
+    "image_quality":     75,
+    "motion_threshold":  0.015,
+    "motion_cooldown":   60,
+    "detection_interval": 1
+  }
+}
+```
+
+Then authenticate Tailscale for remote web UI access:
 
 ```bash
-# follow uploader activity
-journalctl -u monitoring-pipeline-uploader.service -f
+sudo tailscale up
+# open the printed URL in a browser to authorise the device
+tailscale ip -4   # note this IP for web UI access
+```
 
-# in another terminal follow recorder activity (if enabled)
+**Ensure the GSM HAT is powered on** before starting the services.
+
+## Starting the services
+
+```bash
+sudo systemctl start monitoring-pipeline-recorder.service \
+                     monitoring-pipeline-uploader.service \
+                     monitoring-pipeline-webui.service
+```
+
+All three services are enabled at boot after install.
+
+## Services
+
+| Service | Description |
+|---|---|
+| `monitoring-pipeline-recorder` | Captures images/video from the camera into `/outbox` |
+| `monitoring-pipeline-uploader` | Uploads files from `/outbox` to the server via GSM AT+HTTP |
+| `monitoring-pipeline-webui` | Local management dashboard on port 8080 |
+
+## Recording modes
+
+Set via `recording.mode` in `client.json`:
+
+| Mode | Description |
+|---|---|
+| `image_motion` | JPEG captured when motion is detected (default) |
+| `image_interval` | JPEG captured at a fixed interval |
+| `motion` | MP4 clip recorded when motion is detected |
+| `segment` | Continuous fixed-duration MP4 chunks |
+
+## Remote config via SMS
+
+Send a JSON patch as a plain SMS to the device's SIM number. Changes are applied within 60 seconds.
+
+Examples:
+```
+{"recording":{"mode":"segment"}}
+{"recording":{"motion_threshold":0.03}}
+{"webp_quality":60,"poll_interval":30}
+{"recording":{"enabled":false}}
+```
+
+Keys under `recording` require the recorder service to restart automatically. Uploader keys (`webp_quality`, `webp_compress`, `poll_interval`, `max_retries`, `retry_delay`) take effect immediately.
+
+Use the server's `/config-help` page to build and copy SMS patches interactively.
+
+## Upload metadata
+
+Each upload includes a JSON sidecar with:
+- `device_id` — hostname of the Pi
+- `mode` — recording mode that produced the file
+- `motion_score` — fraction of pixels that changed (motion modes only)
+- `timestamp` — UTC capture time
+
+The server logs these to `upload_log.txt`.
+
+## Web UI
+
+Accessible at `http://<tailscale-ip>:8080`. Default credentials: `admin` / `monitoring` — change in `/opt/monitoring-pipeline/config/webui.env`.
+
+## Logs
+
+```bash
+journalctl -u monitoring-pipeline-uploader.service -f
 journalctl -u monitoring-pipeline-recorder.service -f
 ```
 
-Once the services are running, putting a video file into `/outbox` should trigger an upload within a few seconds; the file will then appear in `/uploaded`.
+## Integration test
 
-> **Tip:** if you ever reboot the Pi the services will start automatically, so following the first‑time setup above will leave the device running on its own.
+Verify the full pipeline (camera → GSM → server) after installation:
 
-
-## Recorder (audio/video capture)
-
-The recorder service can create timestamped MP4 chunks from a camera or microphone and put them in `/outbox` automatically.
-
-To enable it, add this block to `client.json`:
-
-```json
-"recording": {
-  "enabled": true,
-  "device": "hw:0",
-  "chunk_duration": 60,
-  "sample_rate": 44100,
-  "channels": 1,
-  "bitrate_kbps": 128,
-  "ffmpeg_path": "ffmpeg",
-  "min_size_bytes": 1024
-}
+```bash
+cd /opt/monitoring-pipeline
+venv/bin/python3 pi-client/test_record_upload.py
 ```
 
-Defaults are mostly sensible; change `chunk_duration` or `device` as needed. Make sure `ffmpeg` is installed (`sudo apt install ffmpeg`).
+## Troubleshooting
 
-The recorder writes `.tmp` files while recording and renames them to `.mp4` when done; the uploader ignores files ending in `.tmp`.
-
-
-## Configuration overview
-
-The client uses a JSON file at `/opt/monitoring-pipeline/config/client.json`.
-
-Example:
-```json
-{
-  "outbox_dir": "/outbox",
-  "uploaded_dir": "/uploaded",
-  "server_url": "http://localhost:5000",
-  "poll_interval": 10,
-  "retry_delay": 300,
-  "max_retries": 3
-}
-```
-
-See the file itself for comments and other options (GSM modem settings, etc.).
-
-
-## Testing and troubleshooting
-
-- You can **stop**, **start** or **restart** the services while debugging:
-  ```bash
-  sudo systemctl stop monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
-  sudo systemctl start monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
-  sudo systemctl restart monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
-  ```
-  use `status` to check their state.
-
-- Test a manual upload:
-  ```bash
-  curl -F "file=@/outbox/test.mp4" http://SERVER:5000/upload
-  ```
-- If uploads stop:
-  * Ensure uploader service is active (`systemctl status`).
-  * Check `/outbox` and `/uploaded` permissions (`ls -la`).
-  * Verify the server address is correct (`curl /health`).
-- Logs are available with `journalctl` for both services.
-
-
-## Notes
-
-- Services run as the owner of `/opt/monitoring-pipeline`; you do not need a special user.
-- The recorder is optional; leave `recording.enabled` set to `false` to disable.
-- **GSM modem**: at present the uploader expects a working GSM modem (configured via `gsm_device` and `gsm_pin` in the JSON). If no modem is attached the service will exit with a runtime error like
-  ````
-  RuntimeError: GSM modem initialization failed - cannot proceed without GSM
-  ````
-  Make sure the hardware is present and the device path is correct.
-- This device should always be able to reach the server (via wifi, ethernet, or GSM).
-
-
-## License
-
-This project is provided as-is.
+| Symptom | Check |
+|---|---|
+| Modem not responding | GSM HAT powered on? Correct device in `gsm_device`? |
+| Uploads not reaching server | `server_url` correct? Signal strength in uploader logs? |
+| No motion captures | `motion_threshold` too high? Check `motion_debug: true` |
+| Web UI unreachable | `tailscale up` authenticated? Check port 8080 is not firewalled |

@@ -343,6 +343,7 @@ class Uploader:
             items = [
                 p for p in self.outbox_dir.glob('*')
                 if not p.name.endswith('.tmp')
+                and not p.name.endswith('.json')
                 and p.exists()
                 and (not p.is_file() or p.stat().st_size > 0)
             ]

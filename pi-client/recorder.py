@@ -105,7 +105,7 @@ class Recorder:
     # ── Utilities ─────────────────────────────────────────────────────────────
 
     def _make_filename(self, ext='.mp4') -> str:
-        ts     = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+        ts     = datetime.now(datetime.UTC).strftime('%Y%m%dT%H%M%SZ')
         prefix = 'image' if ext.startswith('.jp') else 'video'
         return f"{prefix}_{ts}{ext}"
 
@@ -180,7 +180,7 @@ class Recorder:
     def _write_sidecar(self, file_path: Path, motion_score: float = None):
         """Write a JSON sidecar with capture metadata alongside file_path."""
         meta = {
-            "timestamp":    datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "timestamp":    datetime.now(datetime.UTC).strftime('%Y-%m-%dT%H:%M:%SZ'),
             "mode":         self.mode,
             "device_id":    socket.gethostname(),
             "motion_score": round(motion_score, 6) if motion_score is not None else None,
