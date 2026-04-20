@@ -1,7 +1,7 @@
 {
   "gsm_apn": "web.vodafone.de",
   "gsm_device": "/dev/serial0",
-  "gsm_pin": "0427",
+  "gsm_pin": "6307",
   "max_retries": 3,
   "outbox_dir": "/outbox",
   "poll_interval": 10,
