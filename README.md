@@ -1,132 +1,144 @@
-# Monitoring Pipeline (Edge Device)
+# Monitoring Pipeline — Edge Client
 
-This README is for the Raspberry Pi (or other edge device) that records and uploads video/audio. It does **not** cover the server side – only the client.
+Runs on a Raspberry Pi. Captures images (on motion or on a timer), uploads them to the server over a SIM800 GSM modem, and exposes a local web dashboard for management.
 
 ## First-time setup
 
-1. **Copy the project** to the Pi and make it owned by a normal user:
-   ```bash
-   sudo cp -r monitoring-pipeline /opt/monitoring-pipeline
-   sudo chown -R $(whoami) /opt/monitoring-pipeline
-   ```
-
-2. **Create the work directories** (these are the defaults, you can change them later):
-   ```bash
-   mkdir -p /outbox /uploaded
-   ```
-
-3. **Install system requirements**:
-   ```bash
-   cd /opt/monitoring-pipeline
-   sudo bash install.sh          # installs python deps and sets up venv
-   ```
-
-4. **Edit the config file** at `/opt/monitoring-pipeline/config/client.json` and set at least the `server_url` entry to point at your server. You can also tune polling/retry settings.
-
-5. **(Optional) enable recording** by adding a `recording` section in the same JSON. See the "Recorder" section below.
-
-
-## Quick start – client side
-
-With the prerequisites done you can enable and start the services:
+Clone or copy this repo onto the Pi, then run the installer as root from the project directory:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
-sudo systemctl start monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
+cd /opt/Rodent-client
+sudo bash install.sh
 ```
 
-View the logs to see what the services are doing:
+The installer will prompt for:
+
+| Prompt | Default | Notes |
+|--------|---------|-------|
+| Server URL | — | Required. Use your server IP, hostname, or ngrok URL |
+| Device ID | hostname | Identifies this Pi in upload metadata |
+| GSM APN | `web.vodafone.de` | Data APN for your SIM card |
+| GSM serial device | `/dev/serial0` | Serial port the SIM800 modem is on |
+| SIM PIN | *(blank)* | Entered silently with confirmation. Stored in `client.json` (mode 640) |
+| Recording mode | `image_motion` | `1` = JPEG on motion, `2` = JPEG on a timer |
+| Web UI password | `monitoring` | Password for the dashboard at port 8080 |
+| Start services now | yes | Enables and starts all systemd services |
+
+The installer:
+- Installs Python dependencies into a venv at `/opt/monitoring-pipeline/venv`
+- Writes `/opt/monitoring-pipeline/config/client.json` and `webui.env`
+- Configures PPP with the entered APN for the GSM data connection
+- Installs Tailscale for remote access
+- Copies source files to `/opt/monitoring-pipeline/`
+- Installs and optionally starts the systemd services
+
+Re-running `install.sh` is safe — it loads existing values as defaults.
+
+## How it works
+
+```
+rpicam-still → /outbox/image_YYYYMMDDThhmmssZ.jpg
+                          + .json sidecar (device_id, mode, timestamp, motion_score)
+                    ↓
+              uploader reads oldest image + sidecar
+              → multipart POST to server /upload
+              → moves image to /uploaded, deletes sidecar
+```
+
+## Services
+
+Five systemd services are installed under the name prefix `monitoring-pipeline-`:
+
+| Service | Role |
+|---------|------|
+| `recorder` | Captures images to `/outbox` |
+| `uploader` | Uploads images from `/outbox` to the server via GSM |
+| `webui` | Local dashboard at `http://<pi-ip>:8080` |
+| `gsm-pin` | One-shot: unlocks SIM PIN before the GSM connection starts |
+| `gsm` | Establishes the PPP data connection |
 
 ```bash
-# follow uploader activity
-journalctl -u monitoring-pipeline-uploader.service -f
+# Check status
+sudo systemctl status monitoring-pipeline-recorder
+sudo systemctl status monitoring-pipeline-uploader
 
-# in another terminal follow recorder activity (if enabled)
-journalctl -u monitoring-pipeline-recorder.service -f
+# Follow logs
+journalctl -u monitoring-pipeline-uploader -f
+journalctl -u monitoring-pipeline-recorder -f
+
+# Restart after a config change
+sudo systemctl restart monitoring-pipeline-recorder monitoring-pipeline-uploader
 ```
 
-Once the services are running, putting a video file into `/outbox` should trigger an upload within a few seconds; the file will then appear in `/uploaded`.
+## Configuration
 
-> **Tip:** if you ever reboot the Pi the services will start automatically, so following the first‑time setup above will leave the device running on its own.
+Config lives at `/opt/monitoring-pipeline/config/client.json`. It can be edited directly or via the web dashboard (Config tab).
 
+Key settings:
 
-## Recorder (audio/video capture)
+**Upload**
+- `server_url` — server address (e.g. `http://192.168.1.10:8000` or an ngrok URL)
+- `webp_compress` / `webp_quality` — re-encode JPEGs as WebP before upload to reduce transfer size
+- `poll_interval` — seconds between outbox checks (default 10)
+- `max_retries` / `retry_delay` — upload retry behaviour
 
-The recorder service can create timestamped MP4 chunks from a camera or microphone and put them in `/outbox` automatically.
+**GSM**
+- `gsm_device` — serial port (default `/dev/serial0`)
+- `gsm_pin` — SIM PIN (blank if not required)
+- `gsm_apn` — data APN for your carrier
 
-To enable it, add this block to `client.json`:
+**Recording**
+- `recording.mode` — `image_motion` or `image_interval`
+- `recording.motion_threshold` — fraction of pixels that must change to trigger (0–1, default 0.015)
+- `recording.motion_cooldown` — seconds to wait after a capture before checking for motion again
+- `recording.image_interval` — seconds between captures in interval mode
+- `recording.image_quality` — JPEG quality 1–100 (default 75)
+- `recording.width` / `recording.height` — capture resolution (default 1280×720)
+- `recording.motion_debug` — set `true` to log the motion ratio on every check, useful for tuning `motion_threshold`
 
-```json
-"recording": {
-  "enabled": true,
-  "device": "hw:0",
-  "chunk_duration": 60,
-  "sample_rate": 44100,
-  "channels": 1,
-  "bitrate_kbps": 128,
-  "ffmpeg_path": "ffmpeg",
-  "min_size_bytes": 1024
-}
+Restart the relevant service after any change:
+```bash
+sudo systemctl restart monitoring-pipeline-recorder  # after recording changes
+sudo systemctl restart monitoring-pipeline-uploader  # after upload/GSM changes
 ```
 
-Defaults are mostly sensible; change `chunk_duration` or `device` as needed. Make sure `ffmpeg` is installed (`sudo apt install ffmpeg`).
+## Web dashboard
 
-The recorder writes `.tmp` files while recording and renames them to `.mp4` when done; the uploader ignores files ending in `.tmp`.
+Accessible at `http://<tailscale-ip>:8080` (or local IP) with the credentials from `webui.env`.
 
+- **Dashboard** — service status, GSM signal strength, outbox/uploaded file counts, Tailscale SSH address
+- **Logs** — live tail of `/var/log/monitoring-pipeline.log`
+- **Config** — edit and save `client.json` in-browser
 
-## Configuration overview
+## Testing
 
-The client uses a JSON file at `/opt/monitoring-pipeline/config/client.json`.
-
-Example:
-```json
-{
-  "outbox_dir": "/outbox",
-  "uploaded_dir": "/uploaded",
-  "server_url": "http://localhost:5000",
-  "poll_interval": 10,
-  "retry_delay": 300,
-  "max_retries": 3
-}
+Test image capture and upload (no GSM modem needed — posts directly over HTTP):
+```bash
+cd /opt/monitoring-pipeline
+venv/bin/python3 pi-client/test_record_upload.py
 ```
 
-See the file itself for comments and other options (GSM modem settings, etc.).
+This captures a test image with `rpicam-still` (or falls back to a 1×1 dummy JPEG if no camera is attached), POSTs it to the configured server URL, and reports success or failure.
 
+## Tailscale
 
-## Testing and troubleshooting
+```bash
+sudo tailscale up        # authenticate (follow the printed URL)
+tailscale ip -4          # get the Pi's Tailscale IP
+```
 
-- You can **stop**, **start** or **restart** the services while debugging:
-  ```bash
-  sudo systemctl stop monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
-  sudo systemctl start monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
-  sudo systemctl restart monitoring-pipeline-uploader.service monitoring-pipeline-recorder.service
-  ```
-  use `status` to check their state.
+Once connected, the Pi is reachable from any device on your Tailnet:
+```bash
+ssh root@<tailscale-ip>
+# or open http://<tailscale-ip>:8080 for the dashboard
+```
 
-- Test a manual upload:
-  ```bash
-  curl -F "file=@/outbox/test.mp4" http://SERVER:5000/upload
-  ```
-- If uploads stop:
-  * Ensure uploader service is active (`systemctl status`).
-  * Check `/outbox` and `/uploaded` permissions (`ls -la`).
-  * Verify the server address is correct (`curl /health`).
-- Logs are available with `journalctl` for both services.
+## Troubleshooting
 
-
-## Notes
-
-- Services run as the owner of `/opt/monitoring-pipeline`; you do not need a special user.
-- The recorder is optional; leave `recording.enabled` set to `false` to disable.
-- **GSM modem**: at present the uploader expects a working GSM modem (configured via `gsm_device` and `gsm_pin` in the JSON). If no modem is attached the service will exit with a runtime error like
-  ````
-  RuntimeError: GSM modem initialization failed - cannot proceed without GSM
-  ````
-  Make sure the hardware is present and the device path is correct.
-- This device should always be able to reach the server (via wifi, ethernet, or GSM).
-
-
-## License
-
-This project is provided as-is.
+| Symptom | Fix |
+|---------|-----|
+| Uploader exits immediately | Check modem is on `/dev/serial0`; verify SIM PIN in `client.json` |
+| Images not appearing on server | Check `server_url` in config; verify server is reachable (`curl <url>/health`) |
+| `/outbox` growing, nothing uploaded | Check GSM signal in dashboard; check uploader logs |
+| Motion not triggering | Lower `motion_threshold` or enable `motion_debug` to see live ratios |
+| Dashboard not accessible | Check webui service is running; confirm Tailscale is authenticated |
