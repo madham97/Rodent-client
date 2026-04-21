@@ -1,66 +1,177 @@
 #!/bin/bash
-# Requirements installation script
-# Run this before deploying the monitoring pipeline
+# Monitoring pipeline client — installer
+# Run as root from the Rodent-client directory: sudo bash install.sh
 
 set -e
 
-echo "Installing monitoring pipeline requirements..."
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+INSTALL_DIR=/opt/monitoring-pipeline
 
-# Install python3-venv if not available
-if ! python3 -m venv --help > /dev/null 2>&1; then
-    echo "Installing python3-venv..."
-    apt-get update
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: run as root: sudo bash install.sh"
+    exit 1
+fi
+
+echo ""
+echo "=== Monitoring Pipeline Installer ==="
+echo ""
+
+# ── Load defaults from existing config ────────────────────────────────────────
+EXISTING="$INSTALL_DIR/config/client.json"
+_json() {
+    python3 -c "import json; d=json.load(open('$EXISTING')); print(d.get('$1','$2'))" \
+        2>/dev/null || echo "$2"
+}
+
+if [ -f "$EXISTING" ]; then
+    echo "Existing config found at $EXISTING — press Enter to keep current values."
+    echo ""
+    DEF_URL=$(_json server_url "")
+    DEF_APN=$(_json gsm_apn "web.vodafone.de")
+    DEF_DEV=$(_json gsm_device "/dev/serial0")
+    DEF_DID=$(_json device_id "$(hostname)")
+else
+    DEF_URL=""
+    DEF_APN="web.vodafone.de"
+    DEF_DEV="/dev/serial0"
+    DEF_DID="$(hostname)"
+fi
+
+# ── Configuration prompts ──────────────────────────────────────────────────────
+read -rp "Server URL [${DEF_URL:-required}]: " _IN
+SERVER_URL="${_IN:-$DEF_URL}"
+if [ -z "$SERVER_URL" ]; then echo "Error: server URL is required."; exit 1; fi
+
+read -rp "Device ID [$DEF_DID]: " _IN
+DEVICE_ID="${_IN:-$DEF_DID}"
+
+read -rp "GSM APN [$DEF_APN]: " _IN
+GSM_APN="${_IN:-$DEF_APN}"
+
+read -rp "GSM serial device [$DEF_DEV]: " _IN
+GSM_DEVICE="${_IN:-$DEF_DEV}"
+
+echo -n "SIM PIN (leave blank if none): "
+read -rs GSM_PIN; echo
+if [ -n "$GSM_PIN" ]; then
+    echo -n "Confirm SIM PIN: "
+    read -rs GSM_PIN2; echo
+    if [ "$GSM_PIN" != "$GSM_PIN2" ]; then echo "Error: PINs do not match."; exit 1; fi
+    echo "Note: PIN will be stored in plaintext in client.json (mode 640)."
+fi
+
+echo ""
+echo "Recording mode:"
+echo "  1) image_motion   - capture JPEG when motion detected (default)"
+echo "  2) image_interval - capture JPEG on a fixed timer"
+read -rp "Choice [1]: " _CHOICE
+[[ "$_CHOICE" == "2" ]] && REC_MODE="image_interval" || REC_MODE="image_motion"
+
+echo ""
+WRITE_WEBUI=0
+if [ -f "$INSTALL_DIR/config/webui.env" ]; then
+    read -rp "Change Web UI password? [y/N]: " _CHG
+fi
+if [[ "$_CHG" =~ ^[Yy]$ ]] || [ ! -f "$INSTALL_DIR/config/webui.env" ]; then
+    echo -n "Web UI password [monitoring]: "
+    read -rs WEBUI_PASS; echo
+    WEBUI_PASS="${WEBUI_PASS:-monitoring}"
+    [ "$WEBUI_PASS" = "monitoring" ] && echo "Warning: using default password. Change it before exposing the dashboard."
+    WRITE_WEBUI=1
+fi
+
+echo ""
+echo "--- Installing ---"
+
+# ── Directories ────────────────────────────────────────────────────────────────
+mkdir -p "$INSTALL_DIR"/{config,pi-client,scripts}
+mkdir -p /outbox /uploaded /var/log
+touch /var/log/monitoring-pipeline.log
+echo "Directories ready."
+
+# ── Copy source files ──────────────────────────────────────────────────────────
+cp -r "$SCRIPT_DIR/pi-client/"* "$INSTALL_DIR/pi-client/"
+cp -r "$SCRIPT_DIR/scripts/"*   "$INSTALL_DIR/scripts/"
+echo "Source files installed."
+
+# ── Python virtual environment ─────────────────────────────────────────────────
+if ! python3 -m venv --help >/dev/null 2>&1; then
     apt-get install -y python3-venv
 fi
+python3 -m venv "$INSTALL_DIR/venv"
+"$INSTALL_DIR/venv/bin/pip" install --upgrade pip -q
+"$INSTALL_DIR/venv/bin/pip" install flask requests pyserial pillow -q
+echo "Python environment ready."
 
-# Create virtual environment
-echo "Creating virtual environment..."
-python3 -m venv /opt/monitoring-pipeline/venv
-
-# Activate venv and install requirements
-source /opt/monitoring-pipeline/venv/bin/activate
-echo "Installing Python requirements..."
-pip install --upgrade pip
-pip install flask requests pyserial pillow
-
-# Create necessary directories
-mkdir -p /outbox /uploaded
-mkdir -p /var/log
-touch /var/log/monitoring-pipeline.log
-
-# Create web UI credentials file if missing
-if [ ! -f /opt/monitoring-pipeline/config/webui.env ]; then
-    cat > /opt/monitoring-pipeline/config/webui.env << 'EOF'
-WEBUI_USERNAME=admin
-WEBUI_PASSWORD=monitoring
-WEBUI_PORT=8080
+# ── Write client.json ──────────────────────────────────────────────────────────
+cat > "$INSTALL_DIR/config/client.json" << EOF
+{
+  "server_url":    "$SERVER_URL",
+  "device_id":     "$DEVICE_ID",
+  "outbox_dir":    "/outbox",
+  "uploaded_dir":  "/uploaded",
+  "gsm_device":    "$GSM_DEVICE",
+  "gsm_pin":       "$GSM_PIN",
+  "gsm_apn":       "$GSM_APN",
+  "poll_interval": 10,
+  "max_retries":   3,
+  "retry_delay":   10,
+  "webp_compress": true,
+  "webp_quality":  80,
+  "recording": {
+    "mode":               "$REC_MODE",
+    "camera_id":          0,
+    "width":              1280,
+    "height":             720,
+    "rpicam_still_path":  "rpicam-still",
+    "min_size_bytes":     1024,
+    "motion_threshold":   0.015,
+    "detection_interval": 1,
+    "motion_cooldown":    60,
+    "detection_width":    320,
+    "detection_height":   240,
+    "temporal_alpha":     0.1,
+    "motion_debug":       false,
+    "image_interval":     30,
+    "image_quality":      75
+  }
+}
 EOF
-    echo "Web UI credentials written to config/webui.env — change the password!"
+chmod 640 "$INSTALL_DIR/config/client.json"
+echo "client.json written."
+
+# ── Write webui.env ────────────────────────────────────────────────────────────
+if [ "$WRITE_WEBUI" -eq 1 ]; then
+    printf 'WEBUI_USERNAME=admin\nWEBUI_PASSWORD=%s\nWEBUI_PORT=8080\n' \
+        "$WEBUI_PASS" > "$INSTALL_DIR/config/webui.env"
+    chmod 640 "$INSTALL_DIR/config/webui.env"
+    echo "webui.env written."
 fi
 
-# Install Tailscale via apt (works on Debian Bookworm / Raspberry Pi OS)
-if ! command -v tailscale &> /dev/null; then
-    echo "Installing Tailscale..."
-    curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg \
-        | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-    curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.tailscale-keyring.list \
-        | tee /etc/apt/sources.list.d/tailscale.list
-    apt-get update -qq
-    apt-get install -y tailscale
-else
+# ── Tailscale ──────────────────────────────────────────────────────────────────
+if command -v tailscale &>/dev/null; then
     echo "Tailscale already installed: $(tailscale version | head -1)"
+else
+    echo "Installing Tailscale..."
+    if curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg \
+            | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null \
+    && curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.tailscale-keyring.list \
+            | tee /etc/apt/sources.list.d/tailscale.list >/dev/null; then
+        apt-get update -qq && apt-get install -y tailscale -q
+        echo "Tailscale installed."
+    else
+        echo "Warning: Tailscale download failed. Install manually: curl -fsSL https://tailscale.com/install.sh | sh"
+    fi
+fi
+if command -v tailscale &>/dev/null; then
+    systemctl enable --now tailscaled 2>/dev/null || true
 fi
 
-# Enable and start tailscaled (the daemon)
-systemctl enable --now tailscaled
+# ── GSM / PPP ──────────────────────────────────────────────────────────────────
+apt-get install -y ppp -q
 
-# Install ppp for GSM data connection
-echo "Installing ppp..."
-apt-get install -y ppp
-
-# PPP chat script for Vodafone Germany
 mkdir -p /etc/ppp/chatscripts
-cat > /etc/ppp/chatscripts/vodafone-de << 'EOF'
+cat > /etc/ppp/chatscripts/gsm-connect << EOF
 ABORT 'BUSY'
 ABORT 'NO CARRIER'
 ABORT 'NO DIALTONE'
@@ -69,15 +180,14 @@ ABORT 'ERROR'
 TIMEOUT 30
 '' ATZ
 OK ATE0
-OK AT+CGDCONT=1,"IP","web.vodafone.de"
+OK AT+CGDCONT=1,"IP","$GSM_APN"
 OK ATD*99#
 CONNECT ''
 EOF
-chmod 640 /etc/ppp/chatscripts/vodafone-de
+chmod 640 /etc/ppp/chatscripts/gsm-connect
 
-# PPP peer config for GSM modem
-cat > /etc/ppp/peers/gsm << 'EOF'
-/dev/serial0
+cat > /etc/ppp/peers/gsm << EOF
+$GSM_DEVICE
 115200
 noauth
 nodefaultroute
@@ -87,50 +197,55 @@ maxfail 0
 holdoff 10
 crtscts
 lock
-connect "/usr/sbin/chat -v -f /etc/ppp/chatscripts/vodafone-de"
+connect "/usr/sbin/chat -v -f /etc/ppp/chatscripts/gsm-connect"
 EOF
 
-# ip-up script: add GSM as a lower-priority default route (metric 700)
-# so WiFi (metric 600) is preferred when both are up
 mkdir -p /etc/ppp/ip-up.d
 cat > /etc/ppp/ip-up.d/01-gsm-route << 'EOF'
 #!/bin/bash
 ip route add default dev ppp0 metric 700 2>/dev/null || true
 EOF
 chmod +x /etc/ppp/ip-up.d/01-gsm-route
+echo "PPP configured (APN: $GSM_APN, device: $GSM_DEVICE)."
 
-# Copy service files
-echo "Installing systemd services..."
-cp systemd/monitoring-pipeline-uploader.service   /etc/systemd/system/
-cp systemd/monitoring-pipeline-recorder.service   /etc/systemd/system/
-cp systemd/monitoring-pipeline-webui.service      /etc/systemd/system/
-cp systemd/monitoring-pipeline-gsm-pin.service    /etc/systemd/system/
-cp systemd/monitoring-pipeline-gsm.service        /etc/systemd/system/
+# ── Systemd services ───────────────────────────────────────────────────────────
+for svc in monitoring-pipeline-uploader monitoring-pipeline-recorder \
+           monitoring-pipeline-webui monitoring-pipeline-gsm-pin \
+           monitoring-pipeline-gsm; do
+    cp "$SCRIPT_DIR/systemd/$svc.service" /etc/systemd/system/
+done
 systemctl daemon-reload
+echo "Systemd services installed."
 
-# Copy config (if not exists) into the single-folder layout under /opt
-mkdir -p /opt/monitoring-pipeline/config
-if [ ! -f /opt/monitoring-pipeline/config/client.json ]; then
-    cp config/client.json /opt/monitoring-pipeline/config/client.json
-    echo "Config file created at /opt/monitoring-pipeline/config/client.json"
-    echo "Edit it to set the correct server URL!"
+# ── Enable and start ───────────────────────────────────────────────────────────
+echo ""
+read -rp "Enable and start services now? [Y/n]: " _START
+if [[ ! "$_START" =~ ^[Nn]$ ]]; then
+    for svc in monitoring-pipeline-recorder monitoring-pipeline-uploader monitoring-pipeline-webui; do
+        if systemctl enable --now "$svc" 2>/dev/null; then
+            echo "Started: $svc"
+        else
+            echo "Warning: $svc did not start. Check: journalctl -u $svc -n 20"
+        fi
+    done
 fi
 
-echo "Installation complete!"
+# ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
-echo "Next steps:"
-echo "  1. Edit /opt/monitoring-pipeline/config/client.json to set:"
-echo "     - server_url: your server IP and port (e.g., http://192.168.1.100:5000)"
-echo "     - gsm_device: device path for GSM modem (default: /dev/serial0)"
-echo "     - gsm_pin: SIM card PIN if needed"
-echo "     - recording: enable audio/video recording settings"
-echo "  2. Edit config/webui.env to set a strong password"
-echo "  3. Connect the Pi to your Tailscale network:"
-echo "       sudo tailscale up"
-echo "     Follow the URL it prints to authorise the device."
-echo "     Then get its Tailscale IP:  tailscale ip -4"
-echo "  4. sudo systemctl daemon-reload"
-echo "  5. sudo systemctl enable monitoring-pipeline-recorder.service monitoring-pipeline-uploader.service monitoring-pipeline-webui.service"
-echo "  6. sudo systemctl start monitoring-pipeline-recorder.service monitoring-pipeline-uploader.service monitoring-pipeline-webui.service"
-echo "  7. Open http://<tailscale-ip>:8080 from any device on your Tailnet"
-echo "     (login: admin / monitoring  — change this in config/webui.env)"
+echo "=== Installation complete ==="
+echo ""
+echo "  Server URL : $SERVER_URL"
+echo "  Device ID  : $DEVICE_ID"
+echo "  GSM        : $GSM_APN on $GSM_DEVICE"
+[ -n "$GSM_PIN" ] && echo "  SIM PIN    : stored in client.json (mode 640)"
+echo "  Recording  : $REC_MODE"
+echo ""
+TS_IP="$(tailscale ip -4 2>/dev/null || true)"
+if [ -n "$TS_IP" ]; then
+    echo "  Tailscale IP : $TS_IP"
+    echo "  Dashboard    : http://${TS_IP}:8080  (user: admin)"
+else
+    echo "  Next: run 'sudo tailscale up' to authenticate Tailscale."
+    echo "  Then open: http://<tailscale-ip>:8080"
+fi
+echo ""

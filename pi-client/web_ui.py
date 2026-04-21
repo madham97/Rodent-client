@@ -86,9 +86,11 @@ def get_tailscale_ip():
 
 
 def dir_stats(path):
-    """Return (file_count, total_bytes) for all media files in path."""
+    """Return (file_count, total_bytes) for image files in path."""
+    IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
     try:
-        files = [p for p in Path(path).iterdir() if p.is_file() and not p.name.startswith('.')]
+        files = [p for p in Path(path).iterdir()
+                 if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
         return len(files), sum(f.stat().st_size for f in files)
     except Exception:
         return 0, 0
@@ -223,7 +225,7 @@ HTML = r"""<!DOCTYPE html>
 
 <nav class="navbar navbar-dark mb-4">
   <div class="container-fluid px-4">
-    <span class="navbar-brand mb-0 h1"><i class="bi bi-camera-video-fill"></i> Monitoring Pipeline</span>
+    <span class="navbar-brand mb-0 h1"><i class="bi bi-camera-fill"></i> Monitoring Pipeline</span>
     <span class="text-white-50 small" id="ts"></span>
   </div>
 </nav>
@@ -322,14 +324,14 @@ HTML = r"""<!DOCTYPE html>
             <p class="fw-semibold mb-1 text-uppercase" style="font-size:0.7rem;letter-spacing:.05em">Upload</p>
             <table class="table table-sm table-borderless mb-3" style="font-size:0.82rem">
               <tbody>
-                <tr><td class="text-nowrap pe-2"><code>server_url</code></td><td class="text-muted">Remote server to upload clips to</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>server_url</code></td><td class="text-muted">Remote server to upload images to</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>webp_compress</code></td><td class="text-muted">Re-encode JPEGs as WebP before upload for smaller transfer (true/false). Original JPEG kept on disk.</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>webp_quality</code></td><td class="text-muted">WebP encode quality for upload (1–100, default 80)</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>outbox_dir</code></td><td class="text-muted">Clips wait here before upload</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>uploaded_dir</code></td><td class="text-muted">Clips moved here after successful upload</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>max_retries</code></td><td class="text-muted">Upload attempts before giving up on a clip</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>outbox_dir</code></td><td class="text-muted">Images wait here before upload</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>uploaded_dir</code></td><td class="text-muted">Images moved here after successful upload</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>max_retries</code></td><td class="text-muted">Upload attempts before giving up on a file</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>retry_delay</code></td><td class="text-muted">Seconds between upload retries</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>poll_interval</code></td><td class="text-muted">Seconds between checks for new clips</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>poll_interval</code></td><td class="text-muted">Seconds between checks for new images</td></tr>
               </tbody>
             </table>
 
@@ -344,15 +346,11 @@ HTML = r"""<!DOCTYPE html>
             <p class="fw-semibold mb-1 text-uppercase" style="font-size:0.7rem;letter-spacing:.05em">Recording</p>
             <table class="table table-sm table-borderless mb-3" style="font-size:0.82rem">
               <tbody>
-                <tr><td class="text-nowrap pe-2"><code>enabled</code></td><td class="text-muted">Enable or disable recording</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>mode</code></td><td class="text-muted"><code>segment</code> continuous video chunks · <code>motion</code> video on movement · <code>image_interval</code> JPEG every N seconds · <code>image_motion</code> JPEG on movement</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>mode</code></td><td class="text-muted"><code>image_motion</code> JPEG on movement · <code>image_interval</code> JPEG every N seconds</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>camera_id</code></td><td class="text-muted">Camera index (0 = default)</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>chunk_duration</code></td><td class="text-muted">Length of each clip in seconds</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>width</code> / <code>height</code></td><td class="text-muted">Recording resolution in pixels</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>framerate</code></td><td class="text-muted">Frames per second</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>bitrate</code></td><td class="text-muted">Encoding bitrate e.g. <code>5Mbps</code></td></tr>
-                <tr><td class="text-nowrap pe-2"><code>min_size_bytes</code></td><td class="text-muted">Minimum file size to treat a clip as valid</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>rpicam_vid_path</code></td><td class="text-muted">Path to rpicam-vid binary</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>width</code> / <code>height</code></td><td class="text-muted">Capture resolution in pixels</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>min_size_bytes</code></td><td class="text-muted">Minimum file size to treat an image as valid</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>rpicam_still_path</code></td><td class="text-muted">Path to rpicam-still binary</td></tr>
               </tbody>
             </table>
 

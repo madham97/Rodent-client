@@ -1,65 +1,104 @@
 #!/usr/bin/env python3
 """
-Simple script for edge device testing.
+On-device integration test.
+Captures a test image (or uses a dummy JPEG) and POSTs it directly to the server
+via HTTP — no GSM modem required.
 
-It records a short video using the same tools the recorder uses (or falls back to a dummy file),
-then uploads it using the existing VideoUploader class and the configuration file.
-
-Run this on the Pi after installation; it will read `/opt/monitoring-pipeline/config/client.json`.
+Usage:
+    python3 test_record_upload.py
+    python3 test_record_upload.py --config /path/to/client.json
 """
 
+import json
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-# import from local modules
-from uploader import load_config, VideoUploader
+from uploader import load_config, build_multipart, BOUNDARY
 
 
-def record_temp(cfg, duration_sec=5):
-    """Record a short clip and return the path to the file."""
+def capture_test_image(cfg) -> tuple[Path, bool]:
+    """Capture a low-res test image with rpicam-still. Falls back to a 1×1 dummy JPEG."""
     outbox = Path(cfg.get('outbox_dir', '/outbox'))
     outbox.mkdir(parents=True, exist_ok=True)
+    path = outbox / f"test_{int(time.time())}.jpg"
 
-    timestamp = int(time.time())
-    filename = f"test_{timestamp}.mp4"
-    path = outbox / filename
-
-    # Use same cmd as recorder for consistency
     cmd = [
-        cfg.get('rpicam_vid_path', 'rpicam-vid'),
+        cfg.get('rpicam_still_path', 'rpicam-still'),
         '--camera', str(cfg.get('camera_id', 0)),
-        '--width', str(cfg.get('width', 1920)),
-        '--height', str(cfg.get('height', 1080)),
-        '--framerate', str(cfg.get('framerate', 30)),
-        '--bitrate', cfg.get('bitrate', '5Mbps'),
-        '--timeout', str(duration_sec * 1000),
-        '-o', str(path)
+        '--width', '640', '--height', '480',
+        '--quality', '75', '--timeout', '1000',
+        '--output', str(path), '--nopreview', '--immediate',
     ]
-
-    print(f"Recording {duration_sec}s clip to {path}...")
     try:
-        subprocess.run(cmd, check=True, timeout=duration_sec + 5)
-        print("Recording finished")
-    except Exception as e:
-        print("rpicam-vid failed (", e, "); writing dummy file instead")
-        # fallback: create a small zero-filled file
-        path.write_bytes(b"\0" * 1024 * 1024)
-    return path
+        r = subprocess.run(cmd, capture_output=True, timeout=10)
+        if r.returncode == 0 and path.exists() and path.stat().st_size > 0:
+            return path, True
+    except Exception:
+        pass
+
+    # Minimal valid JPEG (1×1 white pixel, no camera needed)
+    path.write_bytes(
+        b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00'
+        b'\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n'
+        b'\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a\x1f\x1e\x1d'
+        b'\x1a\x1c\x1c $.\' ",#\x1c\x1c(7),\x01\x02\x03\x04\x05\x06\x07\x08'
+        b'\x09\x0a\x0b\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00'
+        b'\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00'
+        b'\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a'
+        b'\x0b\xff\xda\x00\x08\x01\x01\x00\x00?\x00\xf5\x0f\xff\xd9'
+    )
+    return path, False
 
 
 def main():
-    # load uploader config (defaults to /opt/monitoring-pipeline/config/client.json)
-    config = load_config()
+    cfg_path = '/opt/monitoring-pipeline/config/client.json'
+    if len(sys.argv) > 2 and sys.argv[1] == '--config':
+        cfg_path = sys.argv[2]
 
-    uploader = VideoUploader(config)
+    cfg = load_config(cfg_path)
+    upload_url = cfg.get('server_url', 'http://localhost:8000') + '/upload'
 
-    file_path = record_temp(config)
+    print(f"Server : {upload_url}")
 
-    print(f"Uploading {file_path}...")
-    uploader.upload_file(file_path)
-    print("Upload attempt finished")
+    path, is_real = capture_test_image(cfg)
+    print(f"Image  : {path.name}  ({'camera capture' if is_real else 'dummy JPEG'})")
+
+    metadata = {
+        'device_id':    cfg.get('device_id', 'test-device'),
+        'mode':         'test',
+        'timestamp':    time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'motion_score': '0',
+    }
+    body = build_multipart(path, metadata)
+
+    req = urllib.request.Request(
+        upload_url,
+        data=body,
+        headers={'Content-Type': f'multipart/form-data; boundary={BOUNDARY}'},
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+        if result.get('status') == 'ok':
+            print("Upload : OK")
+        else:
+            print(f"Upload : unexpected response: {result}")
+            sys.exit(1)
+    except urllib.error.HTTPError as e:
+        print(f"Upload : FAILED  HTTP {e.code} {e.reason}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Upload : FAILED  {e}")
+        sys.exit(1)
+    finally:
+        path.unlink(missing_ok=True)
+
+    print("Test passed.")
 
 
 if __name__ == '__main__':

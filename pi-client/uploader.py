@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 BOUNDARY = 'PiPipeline'
 MAX_FILE_BYTES = 300_000  # SIM800 internal HTTP buffer limit
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
 
 
 def _to_webp(file_path: Path, quality: int) -> tuple[bytes, str]:
@@ -39,25 +40,38 @@ def _to_webp(file_path: Path, quality: int) -> tuple[bytes, str]:
         return buf.getvalue(), file_path.stem + '.webp'
 
 
-def build_multipart(file_path: Path, webp_compress: bool = False, webp_quality: int = 80) -> bytes:
-    """Wrap file in a multipart/form-data body. Optionally re-encodes JPEGs as WebP for smaller transfer."""
-    is_image = file_path.suffix.lower() in ('.jpg', '.jpeg')
-    if is_image and webp_compress:
+def build_multipart(file_path: Path, metadata: dict = None, webp_compress: bool = False, webp_quality: int = 80) -> bytes:
+    """Wrap image file in a multipart/form-data body with metadata text fields."""
+    if metadata is None:
+        metadata = {}
+
+    is_jpeg = file_path.suffix.lower() in ('.jpg', '.jpeg')
+    if is_jpeg and webp_compress:
         data, filename = _to_webp(file_path, webp_quality)
-        field        = 'image'
         content_type = 'image/webp'
     else:
         data, filename = file_path.read_bytes(), file_path.name
-        field        = 'image' if is_image else 'video'
-        content_type = 'image/jpeg' if is_image else 'video/mp4'
-    header = (
+        content_type = 'image/jpeg' if is_jpeg else 'image/png'
+
+    body = b''
+    for key in ('device_id', 'mode', 'motion_score', 'timestamp'):
+        value = str(metadata.get(key, ''))
+        body += (
+            f'--{BOUNDARY}\r\n'
+            f'Content-Disposition: form-data; name="{key}"\r\n'
+            f'\r\n'
+            f'{value}\r\n'
+        ).encode()
+
+    body += (
         f'--{BOUNDARY}\r\n'
-        f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
+        f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'
         f'Content-Type: {content_type}\r\n'
         f'\r\n'
     ).encode()
-    footer = f'\r\n--{BOUNDARY}--\r\n'.encode()
-    return header + data + footer
+    body += data
+    body += f'\r\n--{BOUNDARY}--\r\n'.encode()
+    return body
 
 
 class SIM800:
@@ -284,16 +298,17 @@ class Uploader:
         try:
             items = [
                 p for p in self.outbox_dir.glob('*')
-                if not p.name.endswith('.tmp')
-                and p.exists()
-                and (not p.is_file() or p.stat().st_size > 0)
+                if p.is_file()
+                and not p.name.endswith('.tmp')
+                and p.suffix.lower() in IMAGE_EXTS
+                and p.stat().st_size > 0
             ]
             return min(items, key=lambda p: p.stat().st_mtime) if items else None
         except Exception as e:
             logger.error(f"Error reading outbox: {e}")
             return None
 
-    def _upload(self, file_path: Path, attempt=0) -> bool:
+    def _upload(self, file_path: Path, metadata: dict, attempt=0) -> bool:
         size = file_path.stat().st_size
         logger.info(f"Uploading {file_path.name} ({size} bytes, attempt {attempt + 1})")
         t0 = time.time()
@@ -309,7 +324,7 @@ class Uploader:
                 pass  # already moved externally
             return True
 
-        body         = build_multipart(file_path, self.webp_compress, self.webp_quality)
+        body         = build_multipart(file_path, metadata, self.webp_compress, self.webp_quality)
         content_type = f'multipart/form-data; boundary={BOUNDARY}'
 
         status = self.modem.http_post(self.upload_url, body, content_type)
@@ -332,11 +347,20 @@ class Uploader:
         if not oldest:
             return False
 
+        sidecar = oldest.with_suffix('.json')
+        metadata = {}
+        if sidecar.exists():
+            try:
+                metadata = json.loads(sidecar.read_text())
+            except Exception:
+                logger.warning(f"Could not read sidecar: {sidecar.name}")
+
         for attempt in range(self.max_retries):
-            if self._upload(oldest, attempt):
+            if self._upload(oldest, metadata, attempt):
                 try:
                     shutil.move(str(oldest), str(self.uploaded_dir / oldest.name))
                     logger.info(f"Moved to uploaded: {oldest.name}")
+                    sidecar.unlink(missing_ok=True)
                 except Exception as e:
                     logger.error(f"Error moving {oldest.name}: {e}")
                 return True
