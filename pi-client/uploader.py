@@ -268,7 +268,7 @@ class SIM800:
         if not self.wait_ready():
             logger.error("Modem did not respond within timeout")
             return False
-        self._send('ATZ', wait=1)   # factory reset
+        self._send('ATZ', wait=3)   # factory reset — modem needs time to reboot
         self._send('ATE0')          # disable echo
         if not self.unlock_sim():
             return False
@@ -575,8 +575,6 @@ class Uploader:
                 logger.error("Could not open GPRS bearer — check APN settings")
                 sys.exit(1)
 
-            self._save_sim_number()
-
             logger.info("Uploader running.")
             while True:
                 processed = self._process_oldest()
@@ -589,7 +587,10 @@ class Uploader:
             logger.critical(f"Fatal error: {e}")
             sys.exit(1)
         finally:
-            self.modem.bearer_close()
+            try:
+                self.modem.bearer_close()
+            except Exception:
+                pass
             self.modem.close()
 
 

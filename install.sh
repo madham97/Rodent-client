@@ -175,6 +175,18 @@ if command -v tailscale &>/dev/null; then
     systemctl enable --now tailscaled 2>/dev/null || true
 fi
 
+# ── Free serial port for GSM modem ────────────────────────────────────────────
+# Disable the serial getty so it doesn't hold /dev/ttyS0 open
+systemctl stop serial-getty@ttyS0.service 2>/dev/null || true
+systemctl disable serial-getty@ttyS0.service 2>/dev/null || true
+# Remove the serial console from the kernel cmdline so the kernel doesn't claim the port
+CMDLINE=/boot/firmware/cmdline.txt
+if [ -f "$CMDLINE" ] && grep -q 'console=serial0' "$CMDLINE"; then
+    sed -i 's/console=serial0,[0-9]* //g' "$CMDLINE"
+    echo "Removed serial console from $CMDLINE."
+fi
+echo "Serial port freed for GSM modem."
+
 # ── Systemd services ───────────────────────────────────────────────────────────
 for svc in monitoring-pipeline-uploader monitoring-pipeline-recorder \
            monitoring-pipeline-webui; do
