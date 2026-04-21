@@ -112,16 +112,17 @@ def api_status():
 
     services = {name: get_service_status(svc) for name, svc in SERVICES.items()}
 
-    gsm_device = config.get('gsm_device', '/dev/serial0')
-    signal     = get_gsm_signal()
-    ts_ip      = get_tailscale_ip()
+    gsm_device  = config.get('gsm_device', '/dev/serial0')
+    gsm_number  = config.get('gsm_number', '')
+    signal      = get_gsm_signal()
+    ts_ip       = get_tailscale_ip()
 
     outbox_count, outbox_size     = dir_stats(config.get('outbox_dir',   '/outbox'))
     uploaded_count, uploaded_size = dir_stats(config.get('uploaded_dir', '/uploaded'))
 
     return jsonify(
         services=services,
-        gsm=dict(signal=signal, device=gsm_device),
+        gsm=dict(signal=signal, device=gsm_device, number=gsm_number),
         outbox=dict(count=outbox_count, size=fmt_bytes(outbox_size)),
         uploaded=dict(count=uploaded_count, size=fmt_bytes(uploaded_size)),
         ssh=dict(tailscale_ip=ts_ip),
@@ -340,6 +341,7 @@ HTML = r"""<!DOCTYPE html>
               <tbody>
                 <tr><td class="text-nowrap pe-2"><code>gsm_device</code></td><td class="text-muted">Serial port for the GSM modem</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>gsm_pin</code></td><td class="text-muted">SIM PIN — omit if not required</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>gsm_number</code></td><td class="text-muted">Phone number of the SIM — for reference when sending SMS config commands</td></tr>
               </tbody>
             </table>
 
@@ -452,7 +454,8 @@ function fetchStatus() {
 
     document.getElementById('gsm').innerHTML =
       `<div class="mb-1">Signal &nbsp;${bars(d.gsm.signal)}</div>
-       <div class="text-muted small mt-1">Device: <code>${d.gsm.device}</code></div>`;
+       <div class="text-muted small mt-1">Device: <code>${d.gsm.device}</code></div>` +
+      (d.gsm.number ? `<div class="text-muted small">SIM number: <code>${d.gsm.number}</code></div>` : '');
 
     document.getElementById('outbox').innerHTML =
       `<span class="fs-3 fw-bold">${d.outbox.count}</span>

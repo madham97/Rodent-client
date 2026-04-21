@@ -30,11 +30,13 @@ if [ -f "$EXISTING" ]; then
     DEF_APN=$(_json gsm_apn "web.vodafone.de")
     DEF_DEV=$(_json gsm_device "/dev/serial0")
     DEF_DID=$(_json device_id "$(hostname)")
+    DEF_NUM=$(_json gsm_number "")
 else
     DEF_URL=""
     DEF_APN="web.vodafone.de"
     DEF_DEV="/dev/serial0"
     DEF_DID="$(hostname)"
+    DEF_NUM=""
 fi
 
 # ── Configuration prompts ──────────────────────────────────────────────────────
@@ -50,6 +52,9 @@ GSM_APN="${_IN:-$DEF_APN}"
 
 read -rp "GSM serial device [$DEF_DEV]: " _IN
 GSM_DEVICE="${_IN:-$DEF_DEV}"
+
+read -rp "SIM phone number (e.g. +491741959602, leave blank if unknown) [${DEF_NUM}]: " _IN
+GSM_NUMBER="${_IN:-$DEF_NUM}"
 
 echo -n "SIM PIN (leave blank if none): "
 read -rs GSM_PIN; echo
@@ -113,6 +118,7 @@ cat > "$INSTALL_DIR/config/client.json" << EOF
   "gsm_device":    "$GSM_DEVICE",
   "gsm_pin":       "$GSM_PIN",
   "gsm_apn":       "$GSM_APN",
+  "gsm_number":    "$GSM_NUMBER",
   "poll_interval": 10,
   "max_retries":   3,
   "retry_delay":   10,
@@ -137,14 +143,16 @@ cat > "$INSTALL_DIR/config/client.json" << EOF
   }
 }
 EOF
-chmod 640 "$INSTALL_DIR/config/client.json"
+chown root:sudo "$INSTALL_DIR/config/client.json"
+chmod 660 "$INSTALL_DIR/config/client.json"
 echo "client.json written."
 
 # ── Write webui.env ────────────────────────────────────────────────────────────
 if [ "$WRITE_WEBUI" -eq 1 ]; then
     printf 'WEBUI_USERNAME=admin\nWEBUI_PASSWORD=%s\nWEBUI_PORT=8080\n' \
         "$WEBUI_PASS" > "$INSTALL_DIR/config/webui.env"
-    chmod 640 "$INSTALL_DIR/config/webui.env"
+    chown root:sudo "$INSTALL_DIR/config/webui.env"
+    chmod 660 "$INSTALL_DIR/config/webui.env"
     echo "webui.env written."
 fi
 
@@ -195,6 +203,7 @@ echo ""
 echo "  Server URL : $SERVER_URL"
 echo "  Device ID  : $DEVICE_ID"
 echo "  GSM        : $GSM_APN on $GSM_DEVICE"
+[ -n "$GSM_NUMBER" ] && echo "  SIM number : $GSM_NUMBER"
 [ -n "$GSM_PIN" ] && echo "  SIM PIN    : stored in client.json (mode 640)"
 echo "  Recording  : $REC_MODE"
 echo ""

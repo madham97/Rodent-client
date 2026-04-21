@@ -9,6 +9,7 @@ the SIM800's built-in AT+HTTP stack. No pppd required.
 import json
 import logging
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -28,6 +29,107 @@ logger = logging.getLogger(__name__)
 BOUNDARY = 'PiPipeline'
 MAX_FILE_BYTES = 300_000  # SIM800 internal HTTP buffer limit
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
+
+# Keys settable via SMS. (json_section, type, requires_recorder_restart)
+# section=None means top-level in client.json; 'recording' means the recording sub-dict.
+_SMS_KEY_SPEC = {
+    'motion_threshold':   ('recording', float, False),
+    'motion_cooldown':    ('recording', float, False),
+    'detection_interval': ('recording', float, False),
+    'image_interval':     ('recording', float, False),
+    'image_quality':      ('recording', int,   False),
+    'mode':               ('recording', str,   True),
+    'webp_compress':      (None,        bool,  False),
+    'webp_quality':       (None,        int,   False),
+}
+
+
+class SMSConfigHandler:
+    """Parse and apply config changes delivered via SMS."""
+
+    def __init__(self, config_path: str):
+        self._path = config_path
+
+    def handle(self, text: str) -> str:
+        cmd = text.strip()
+        if cmd.upper() == 'STATUS':
+            return self._status()
+        if cmd.upper().startswith('SET '):
+            return self._apply_set(cmd[4:].strip())
+        return 'ERR: unknown command. Use: SET key=value [key=value ...] or STATUS'
+
+    def _load(self):
+        with open(self._path) as f:
+            return json.load(f)
+
+    def _save(self, cfg):
+        with open(self._path, 'w') as f:
+            json.dump(cfg, f, indent=2)
+            f.write('\n')
+
+    def _status(self) -> str:
+        try:
+            cfg = self._load()
+            rec = cfg.get('recording', {})
+            return (
+                f"mode={rec.get('mode', '?')} "
+                f"threshold={rec.get('motion_threshold', '?')} "
+                f"interval={rec.get('image_interval', '?')} "
+                f"quality={rec.get('image_quality', '?')}"
+            )
+        except Exception as e:
+            return f'ERR: {e}'
+
+    def _apply_set(self, args: str) -> str:
+        pairs = {}
+        for token in args.split():
+            if '=' not in token:
+                return f'ERR: bad syntax "{token}" — use key=value'
+            k, _, v = token.partition('=')
+            k = k.strip().lower()
+            if k not in _SMS_KEY_SPEC:
+                return f'ERR: unknown key "{k}"'
+            pairs[k] = v.strip()
+
+        if not pairs:
+            return 'ERR: no key=value pairs found'
+
+        try:
+            cfg = self._load()
+        except Exception as e:
+            return f'ERR: cannot read config: {e}'
+
+        applied = []
+        needs_restart = False
+
+        for k, v in pairs.items():
+            section, cast, restarts = _SMS_KEY_SPEC[k]
+            try:
+                coerced = v.lower() in ('1', 'true', 'yes') if cast is bool else cast(v)
+            except (ValueError, TypeError):
+                return f'ERR: bad value "{v}" for {k}'
+            target = cfg.setdefault(section, {}) if section else cfg
+            target[k] = coerced
+            applied.append(f'{k}={coerced}')
+            if restarts:
+                needs_restart = True
+
+        try:
+            self._save(cfg)
+        except Exception as e:
+            return f'ERR: cannot write config: {e}'
+
+        reply = 'OK: ' + ' '.join(applied)
+        if needs_restart:
+            try:
+                subprocess.run(
+                    ['sudo', 'systemctl', 'restart', 'monitoring-pipeline-recorder'],
+                    capture_output=True, timeout=10,
+                )
+                reply += ' (recorder restarted)'
+            except Exception as e:
+                reply += f' (restart failed: {e})'
+        return reply
 
 
 def _to_webp(file_path: Path, quality: int) -> tuple[bytes, str]:
@@ -184,6 +286,19 @@ class SIM800:
             pass
         return 0
 
+    def get_own_number(self) -> str:
+        """Query the SIM for its own phone number via AT+CNUM.
+        Returns the number string, or '' if the SIM doesn't have one stored."""
+        resp = self._send('AT+CNUM', wait=1)
+        for line in resp.splitlines():
+            if '+CNUM:' in line:
+                parts = line.split(',')
+                if len(parts) >= 2:
+                    number = parts[1].strip().strip('"')
+                    if number:
+                        return number
+        return ''
+
     # ── Bearer (GPRS data connection) ──────────────────────────────────────────
 
     def bearer_open(self):
@@ -204,6 +319,48 @@ class SIM800:
     def bearer_close(self):
         self._send('AT+SAPBR=0,1', wait=2)
         logger.info("GPRS bearer closed")
+
+    # ── SMS ────────────────────────────────────────────────────────────────────
+
+    def read_pending_sms(self) -> list:
+        """Return list of (index, sender, text) for all stored SMS messages."""
+        self._send('AT+CMGF=1')  # text mode
+        resp = self._send('AT+CMGL="ALL"', wait=2)
+        messages = []
+        lines = [l for l in resp.splitlines() if l.strip()]
+        i = 0
+        while i < len(lines):
+            if lines[i].startswith('+CMGL:'):
+                parts = lines[i].split(',')
+                try:
+                    index  = int(parts[0].split(':')[1].strip())
+                    sender = parts[2].strip().strip('"')
+                except (IndexError, ValueError):
+                    i += 1
+                    continue
+                text = lines[i + 1] if i + 1 < len(lines) else ''
+                messages.append((index, sender, text))
+                i += 2
+            else:
+                i += 1
+        return messages
+
+    def delete_sms(self, index: int):
+        self._send(f'AT+CMGD={index}', wait=0.5)
+
+    def send_sms(self, number: str, text: str) -> bool:
+        """Send an SMS to number. Returns True on success."""
+        self._send('AT+CMGF=1')
+        resp = self._send(f'AT+CMGS="{number}"', wait=1)
+        if '>' not in resp:
+            resp += self._wait_for('>', timeout=5)
+        if '>' not in resp:
+            logger.error("send_sms: modem did not prompt for message text")
+            return False
+        self._ser.write(text.encode('ascii', errors='replace') + b'\x1a')
+        self._ser.flush()
+        result = self._wait_for('+CMGS:', timeout=30)
+        return '+CMGS:' in result
 
     # ── HTTP ───────────────────────────────────────────────────────────────────
 
@@ -290,6 +447,10 @@ class Uploader:
             apn=config.get('gsm_apn', 'web.vodafone.de'),
         )
 
+        self._sms_handler = SMSConfigHandler(
+            config.get('_config_path', '/opt/monitoring-pipeline/config/client.json')
+        )
+
         logger.info(f"Uploader initialized. Upload URL: {self.upload_url}")
         if self.webp_compress:
             logger.info(f"WebP compression enabled (quality {self.webp_quality})")
@@ -371,6 +532,38 @@ class Uploader:
         logger.error(f"Failed to upload {oldest.name} after {self.max_retries} attempts")
         return False
 
+    def _save_sim_number(self):
+        """Query the SIM for its own number and write it to client.json if found."""
+        number = self.modem.get_own_number()
+        if not number:
+            logger.info("SIM own number not available (not stored on this SIM)")
+            return
+        try:
+            cfg_path = self._sms_handler._path
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            if cfg.get('gsm_number') == number:
+                return
+            cfg['gsm_number'] = number
+            with open(cfg_path, 'w') as f:
+                json.dump(cfg, f, indent=2)
+                f.write('\n')
+            logger.info(f"SIM number saved to config: {number}")
+        except Exception as e:
+            logger.warning(f"Could not save SIM number to config: {e}")
+
+    def _check_sms(self):
+        try:
+            messages = self.modem.read_pending_sms()
+            for index, sender, text in messages:
+                logger.info(f"SMS from {sender}: {text!r}")
+                reply = self._sms_handler.handle(text)
+                logger.info(f"SMS reply to {sender}: {reply!r}")
+                self.modem.send_sms(sender, reply)
+                self.modem.delete_sms(index)
+        except Exception as e:
+            logger.error(f"SMS check error: {e}")
+
     def run(self):
         self.modem.open()
         try:
@@ -382,9 +575,12 @@ class Uploader:
                 logger.error("Could not open GPRS bearer — check APN settings")
                 sys.exit(1)
 
+            self._save_sim_number()
+
             logger.info("Uploader running.")
             while True:
                 processed = self._process_oldest()
+                self._check_sms()
                 time.sleep(2 if processed else self.poll_interval)
 
         except KeyboardInterrupt:
@@ -402,7 +598,9 @@ def load_config(path=None):
         path = '/opt/monitoring-pipeline/config/client.json'
     try:
         with open(path) as f:
-            return json.load(f)
+            cfg = json.load(f)
+            cfg['_config_path'] = path
+            return cfg
     except Exception as e:
         logger.warning(f"Failed to load config {path}: {e} — using defaults")
     return {
@@ -412,6 +610,7 @@ def load_config(path=None):
         'max_retries':   3,
         'retry_delay':   60,
         'poll_interval': 10,
+        '_config_path':  path,
     }
 
 

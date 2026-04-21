@@ -86,6 +86,7 @@ Key settings:
 - `gsm_device` — serial port (default `/dev/serial0`)
 - `gsm_pin` — SIM PIN (blank if not required)
 - `gsm_apn` — data APN for your carrier
+- `gsm_number` — phone number of the SIM (e.g. `+447700900123`), shown in the dashboard — useful to note here so you know what number to send SMS config commands to
 
 **Recording**
 - `recording.mode` — `image_motion` or `image_interval`
@@ -101,6 +102,44 @@ Restart the relevant service after any change:
 sudo systemctl restart monitoring-pipeline-recorder  # after recording changes
 sudo systemctl restart monitoring-pipeline-uploader  # after upload/GSM changes
 ```
+
+## Remote config via SMS
+
+When the Pi has no internet connection, settings can be updated by sending an SMS to the SIM card in the modem. The uploader checks for messages between uploads and replies automatically.
+
+**Commands**
+
+| SMS text | Effect |
+|----------|--------|
+| `SET key=value` | Update one or more settings |
+| `SET key=value key=value ...` | Update multiple settings at once |
+| `STATUS` | Reply with current mode, threshold, interval, and quality |
+
+**Updatable keys**
+
+| Key | Type | Recorder restart? |
+|-----|------|-------------------|
+| `motion_threshold` | float (0–1) | No |
+| `motion_cooldown` | float (seconds) | No |
+| `detection_interval` | float (seconds) | No |
+| `image_interval` | float (seconds) | No |
+| `image_quality` | int (1–100) | No |
+| `mode` | `image_motion` or `image_interval` | Yes — automatic |
+| `webp_compress` | `true` or `false` | No |
+| `webp_quality` | int (1–100) | No |
+
+**Examples**
+
+```
+SET motion_threshold=0.05
+SET mode=image_interval image_interval=30
+SET image_quality=70 webp_compress=true webp_quality=65
+STATUS
+```
+
+The Pi replies with `OK: key=value ...` on success, or `ERR: ...` describing what went wrong. Changes are written to `client.json` immediately. Keys that require a recorder restart (`mode`) trigger one automatically.
+
+Messages from any phone number are accepted. The reply is sent back to the sender.
 
 ## Web dashboard
 
@@ -142,3 +181,4 @@ ssh root@<tailscale-ip>
 | `/outbox` growing, nothing uploaded | Check GSM signal in dashboard; check uploader logs |
 | Motion not triggering | Lower `motion_threshold` or enable `motion_debug` to see live ratios |
 | Dashboard not accessible | Check webui service is running; confirm Tailscale is authenticated |
+| SMS commands not working | Confirm modem is registered (`AT+CREG?`); check uploader log for `SMS from` lines; ensure SIM can receive SMS |
