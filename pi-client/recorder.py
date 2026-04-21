@@ -133,8 +133,9 @@ class Recorder:
             tmp.unlink(missing_ok=True)
         return None
 
-    def _capture_image(self, path: Path) -> bool:
-        """Capture a full-resolution JPEG to path. Returns True on success."""
+    def _capture_image_tmp(self, path: Path) -> 'Path | None':
+        """Capture a full-resolution JPEG to a .tmp file. Returns the tmp path on success, None on failure.
+        The caller writes the sidecar then renames tmp → path so the image never appears without its sidecar."""
         tmp = path.with_suffix(path.suffix + '.tmp')
         cmd = [
             self.rpicam_still_path,
@@ -149,17 +150,15 @@ class Recorder:
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=15)
             if r.returncode == 0 and tmp.exists() and tmp.stat().st_size >= self.min_size_bytes:
-                tmp.rename(path)
                 logger.info(f"Captured image: {path.name}")
-                return True
+                return tmp
             logger.warning(f"Image capture failed (code {r.returncode})")
         except FileNotFoundError:
             logger.critical(f"rpicam-still not found at '{self.rpicam_still_path}'")
         except Exception as e:
             logger.error(f"Image capture error: {e}")
-        finally:
-            tmp.unlink(missing_ok=True)
-        return False
+        tmp.unlink(missing_ok=True)
+        return None
 
     def _motion_ratio(self, avg, frame) -> float:
         """Return fraction of pixels that changed significantly vs. running average."""
@@ -231,8 +230,10 @@ class Recorder:
 
         while not STOP_FLAG:
             path = self.outbox_dir / self._make_filename()
-            if self._capture_image(path):
+            tmp = self._capture_image_tmp(path)
+            if tmp:
                 self._write_sidecar(path)
+                tmp.rename(path)
             elapsed = 0.0
             while elapsed < self.image_interval and not STOP_FLAG:
                 time.sleep(0.5)
@@ -247,8 +248,10 @@ class Recorder:
 
         def on_motion(score: float):
             path = self.outbox_dir / self._make_filename()
-            if self._capture_image(path):
+            tmp = self._capture_image_tmp(path)
+            if tmp:
                 self._write_sidecar(path, motion_score=score)
+                tmp.rename(path)
 
         self._motion_loop(on_motion)
 
