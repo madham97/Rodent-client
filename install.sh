@@ -167,51 +167,9 @@ if command -v tailscale &>/dev/null; then
     systemctl enable --now tailscaled 2>/dev/null || true
 fi
 
-# ── GSM / PPP ──────────────────────────────────────────────────────────────────
-apt-get install -y ppp -q
-
-mkdir -p /etc/ppp/chatscripts
-cat > /etc/ppp/chatscripts/gsm-connect << EOF
-ABORT 'BUSY'
-ABORT 'NO CARRIER'
-ABORT 'NO DIALTONE'
-ABORT 'NO ANSWER'
-ABORT 'ERROR'
-TIMEOUT 30
-'' ATZ
-OK ATE0
-OK AT+CGDCONT=1,"IP","$GSM_APN"
-OK ATD*99#
-CONNECT ''
-EOF
-chmod 640 /etc/ppp/chatscripts/gsm-connect
-
-cat > /etc/ppp/peers/gsm << EOF
-$GSM_DEVICE
-115200
-noauth
-nodefaultroute
-usepeerdns
-persist
-maxfail 0
-holdoff 10
-crtscts
-lock
-connect "/usr/sbin/chat -v -f /etc/ppp/chatscripts/gsm-connect"
-EOF
-
-mkdir -p /etc/ppp/ip-up.d
-cat > /etc/ppp/ip-up.d/01-gsm-route << 'EOF'
-#!/bin/bash
-ip route add default dev ppp0 metric 700 2>/dev/null || true
-EOF
-chmod +x /etc/ppp/ip-up.d/01-gsm-route
-echo "PPP configured (APN: $GSM_APN, device: $GSM_DEVICE)."
-
 # ── Systemd services ───────────────────────────────────────────────────────────
 for svc in monitoring-pipeline-uploader monitoring-pipeline-recorder \
-           monitoring-pipeline-webui monitoring-pipeline-gsm-pin \
-           monitoring-pipeline-gsm; do
+           monitoring-pipeline-webui; do
     cp "$SCRIPT_DIR/systemd/$svc.service" /etc/systemd/system/
 done
 systemctl daemon-reload
