@@ -21,6 +21,9 @@ coverage.xml
 .pytest_cache
 .hypothesis
 
+# Local instance config (never commit — use config/client.json.template)
+config/client.json
+
 # Web UI credentials (never commit)
 config/webui.env
 

@@ -25,11 +25,10 @@ The installer will prompt for:
 | Start services now | yes | Enables and starts all systemd services |
 
 The installer:
-- Installs Python dependencies into a venv at `/opt/monitoring-pipeline/venv`
-- Writes `/opt/monitoring-pipeline/config/client.json` and `webui.env`
+- Installs Python dependencies into a venv at `/opt/Rodent-client/venv`
+- Writes `/opt/Rodent-client/config/client.json` and `webui.env`
 - Configures PPP with the entered APN for the GSM data connection
 - Installs Tailscale for remote access
-- Copies source files to `/opt/monitoring-pipeline/`
 - Installs and optionally starts the systemd services
 
 Re-running `install.sh` is safe — it loads existing values as defaults.
@@ -72,7 +71,7 @@ sudo systemctl restart monitoring-pipeline-recorder monitoring-pipeline-uploader
 
 ## Configuration
 
-Config lives at `/opt/monitoring-pipeline/config/client.json`. It can be edited directly or via the web dashboard (Config tab).
+Config lives at `/opt/Rodent-client/config/client.json`. It can be edited directly or via the web dashboard (Config tab).
 
 Key settings:
 
@@ -153,7 +152,7 @@ Accessible at `http://<tailscale-ip>:8080` (or local IP) with the credentials fr
 
 Test image capture and upload (no GSM modem needed — posts directly over HTTP):
 ```bash
-cd /opt/monitoring-pipeline
+cd /opt/Rodent-client
 venv/bin/python3 pi-client/test_record_upload.py
 ```
 

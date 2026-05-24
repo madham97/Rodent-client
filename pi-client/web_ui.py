@@ -15,7 +15,7 @@ from flask import Flask, request, Response, jsonify
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-CONFIG_PATH = Path(os.environ.get('CONFIG_PATH', '/opt/monitoring-pipeline/config/client.json'))
+CONFIG_PATH = Path(os.environ.get('CONFIG_PATH', '/opt/Rodent-client/config/client.json'))
 LOG_PATH    = Path(os.environ.get('LOG_PATH',    '/var/log/monitoring-pipeline.log'))
 
 SERVICES = {

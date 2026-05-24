@@ -5,7 +5,7 @@
 set -e
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-INSTALL_DIR=/opt/monitoring-pipeline
+INSTALL_DIR="$SCRIPT_DIR"
 
 if [ "$EUID" -ne 0 ]; then
     echo "Error: run as root: sudo bash install.sh"
@@ -17,7 +17,7 @@ echo "=== Monitoring Pipeline Installer ==="
 echo ""
 
 # ── Load defaults from existing config ────────────────────────────────────────
-EXISTING="$INSTALL_DIR/config/client.json"
+EXISTING="$SCRIPT_DIR/config/client.json"
 _json() {
     python3 -c "import json; d=json.load(open('$EXISTING')); print(d.get('$1','$2'))" \
         2>/dev/null || echo "$2"
@@ -89,15 +89,10 @@ echo ""
 echo "--- Installing ---"
 
 # ── Directories ────────────────────────────────────────────────────────────────
-mkdir -p "$INSTALL_DIR"/{config,pi-client,scripts}
+mkdir -p "$INSTALL_DIR"/config
 mkdir -p /outbox /uploaded /var/log
 touch /var/log/monitoring-pipeline.log
 echo "Directories ready."
-
-# ── Copy source files ──────────────────────────────────────────────────────────
-cp -r "$SCRIPT_DIR/pi-client/"* "$INSTALL_DIR/pi-client/"
-cp -r "$SCRIPT_DIR/scripts/"*   "$INSTALL_DIR/scripts/"
-echo "Source files installed."
 
 # ── Python virtual environment ─────────────────────────────────────────────────
 if ! python3 -m venv --help >/dev/null 2>&1; then

@@ -55,7 +55,7 @@ def capture_test_image(cfg) -> tuple[Path, bool]:
 
 
 def main():
-    cfg_path = '/opt/monitoring-pipeline/config/client.json'
+    cfg_path = '/opt/Rodent-client/config/client.json'
     if len(sys.argv) > 2 and sys.argv[1] == '--config':
         cfg_path = sys.argv[2]
 

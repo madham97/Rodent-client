@@ -260,7 +260,7 @@ class Recorder:
 
 def load_config(path: str = None) -> dict:
     if path is None:
-        path = '/opt/monitoring-pipeline/config/client.json'
+        path = '/opt/Rodent-client/config/client.json'
 
     cfg = {}
     if os.path.exists(path):

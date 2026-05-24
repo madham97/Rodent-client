@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/monitoring-pipeline
-EnvironmentFile=/opt/monitoring-pipeline/config/webui.env
-ExecStart=/opt/monitoring-pipeline/venv/bin/python3 /opt/monitoring-pipeline/pi-client/web_ui.py
+WorkingDirectory=/opt/Rodent-client
+EnvironmentFile=/opt/Rodent-client/config/webui.env
+ExecStart=/opt/Rodent-client/venv/bin/python3 /opt/Rodent-client/pi-client/web_ui.py
 Restart=always
 RestartSec=10
 StandardOutput=journal

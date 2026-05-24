@@ -448,7 +448,7 @@ class Uploader:
         )
 
         self._sms_handler = SMSConfigHandler(
-            config.get('_config_path', '/opt/monitoring-pipeline/config/client.json')
+            config.get('_config_path', '/opt/Rodent-client/config/client.json')
         )
 
         logger.info(f"Uploader initialized. Upload URL: {self.upload_url}")
@@ -596,7 +596,7 @@ class Uploader:
 
 def load_config(path=None):
     if path is None:
-        path = '/opt/monitoring-pipeline/config/client.json'
+        path = '/opt/Rodent-client/config/client.json'
     try:
         with open(path) as f:
             cfg = json.load(f)

@@ -4,8 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/monitoring-pipeline
-ExecStart=/opt/monitoring-pipeline/venv/bin/python3 /opt/monitoring-pipeline/pi-client/uploader.py
+WorkingDirectory=/opt/Rodent-client
+ExecStart=/opt/Rodent-client/venv/bin/python3 /opt/Rodent-client/pi-client/uploader.py --config /opt/Rodent-client/config/client.json
 Restart=always
 RestartSec=30
 StandardOutput=journal
