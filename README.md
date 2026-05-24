@@ -1,6 +1,6 @@
 # Monitoring Pipeline — Edge Client
 
-Runs on a Raspberry Pi. Captures images (on motion or on a timer), uploads them to the server over a SIM800 GSM modem, and exposes a local web dashboard for management.
+Runs on a Raspberry Pi. Captures images (on motion or on a timer), uploads them to the server over a SIM868/SIM800C GSM modem, and exposes a local web dashboard for management.
 
 ## First-time setup
 
@@ -18,7 +18,7 @@ The installer will prompt for:
 | Server URL | — | Required. Use your server IP, hostname, or ngrok URL |
 | Device ID | hostname | Identifies this Pi in upload metadata |
 | GSM APN | `web.vodafone.de` | Data APN for your SIM card |
-| GSM serial device | `/dev/serial0` | Serial port the SIM800 modem is on |
+| GSM serial device | `/dev/serial0` | GPIO UART. Use `/dev/ttyUSB0` for USB mode — see `docs/gsm-hat-setup.md` |
 | SIM PIN | *(blank)* | Entered silently with confirmation. Stored in `client.json` (mode 640) |
 | Recording mode | `image_motion` | `1` = JPEG on motion, `2` = JPEG on a timer |
 | Web UI password | `monitoring` | Password for the dashboard at port 8080 |
@@ -27,9 +27,9 @@ The installer will prompt for:
 The installer:
 - Installs Python dependencies into a venv at `/opt/Rodent-client/venv`
 - Writes `/opt/Rodent-client/config/client.json` and `webui.env`
-- Configures PPP with the entered APN for the GSM data connection
+- Frees the GPIO serial port (disables serial getty, removes kernel console — harmless if using USB mode)
 - Installs Tailscale for remote access
-- Installs and optionally starts the systemd services
+- Installs and optionally starts the three core systemd services (recorder, uploader, webui)
 
 Re-running `install.sh` is safe — it loads existing values as defaults.
 
@@ -46,15 +46,20 @@ rpicam-still → /outbox/image_YYYYMMDDThhmmssZ.jpg
 
 ## Services
 
-Five systemd services are installed under the name prefix `monitoring-pipeline-`:
+Three core systemd services are installed under the name prefix `monitoring-pipeline-`:
 
 | Service | Role |
 |---------|------|
 | `recorder` | Captures images to `/outbox` |
-| `uploader` | Uploads images from `/outbox` to the server via GSM |
+| `uploader` | Uploads images from `/outbox` to the server via GSM; manages its own GPRS bearer via AT commands |
 | `webui` | Local dashboard at `http://<pi-ip>:8080` |
-| `gsm-pin` | One-shot: unlocks SIM PIN before the GSM connection starts |
-| `gsm` | Establishes the PPP data connection |
+
+Two additional service unit files exist in `systemd/` but are not installed by `install.sh`:
+
+| Service | Role |
+|---------|------|
+| `gsm-pin` | Legacy: one-shot SIM PIN unlock before pppd. Not needed — uploader handles PIN unlock itself. |
+| `gsm` | Legacy: establishes a pppd PPP data connection. Not needed — uploader uses AT+HTTPACTION directly. |
 
 ```bash
 # Check status
@@ -82,7 +87,7 @@ Key settings:
 - `max_retries` / `retry_delay` — upload retry behaviour
 
 **GSM**
-- `gsm_device` — serial port (default `/dev/serial0`)
+- `gsm_device` — serial port: `/dev/serial0` for GPIO UART mode, `/dev/ttyUSB0` for USB mode (see `docs/gsm-hat-setup.md`)
 - `gsm_pin` — SIM PIN (blank if not required)
 - `gsm_apn` — data APN for your carrier
 - `gsm_number` — phone number of the SIM (e.g. `+447700900123`), shown in the dashboard — useful to note here so you know what number to send SMS config commands to
@@ -171,11 +176,16 @@ ssh root@<tailscale-ip>
 # or open http://<tailscale-ip>:8080 for the dashboard
 ```
 
+## Further Reading
+
+- [`docs/project-overview.md`](docs/project-overview.md) — detailed architecture, data flow, component internals, and known constraints
+- [`docs/gsm-hat-setup.md`](docs/gsm-hat-setup.md) — full GPIO vs USB setup guide for the Waveshare GSM HAT, including debugging history
+
 ## Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
-| Uploader exits immediately | Check modem is on `/dev/serial0`; verify SIM PIN in `client.json` |
+| Uploader exits immediately | Check `gsm_device` in config (`/dev/serial0` for GPIO, `/dev/ttyUSB0` for USB); verify SIM PIN |
 | Images not appearing on server | Check `server_url` in config; verify server is reachable (`curl <url>/health`) |
 | `/outbox` growing, nothing uploaded | Check GSM signal in dashboard; check uploader logs |
 | Motion not triggering | Lower `motion_threshold` or enable `motion_debug` to see live ratios |

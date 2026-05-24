@@ -189,7 +189,7 @@ class SIM800:
     # ── Serial helpers ─────────────────────────────────────────────────────────
 
     def open(self):
-        self._ser = serial.Serial(self.device, self.baud, timeout=2, rtscts=True)
+        self._ser = serial.Serial(self.device, self.baud, timeout=2, rtscts=False)
         logger.info(f"Serial port {self.device} opened")
 
     def close(self):
