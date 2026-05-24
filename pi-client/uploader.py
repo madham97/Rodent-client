@@ -496,8 +496,8 @@ class Uploader:
 
         logger.warning(f"Upload failed (HTTP {status}): {file_path.name}")
 
-        # 0 = parse failure, 601 = SIM800 network error — re-open bearer
-        if status in (0, 601):
+        # 0 = parse failure, 601/603 = SIM800 network error — re-open bearer
+        if status in (0, 601, 603):
             logger.info("Attempting to re-open GPRS bearer...")
             self.modem.bearer_open()
 
