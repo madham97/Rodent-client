@@ -176,10 +176,30 @@ ssh root@<tailscale-ip>
 # or open http://<tailscale-ip>:8080 for the dashboard
 ```
 
+## Thermal Camera
+
+An optional Waveshare MI48 80×62 thermal camera can be attached via GPIO (I2C + SPI). When connected it supplements the IR camera with a thermal heat map.
+
+| Script | Purpose |
+|--------|---------|
+| `pi-client/thermal/snapshot.py` | Capture one frame → PNG |
+| `pi-client/thermal/record_video.py` | Record N seconds → MP4 |
+
+Quick test (run from a writable directory):
+
+```bash
+cd ~
+python3 /opt/Rodent-client/pi-client/thermal/snapshot.py
+# opens /opt/Rodent-client/thermal.png
+```
+
+Full wiring, config, and installation instructions: [`docs/thermal-camera-setup.md`](docs/thermal-camera-setup.md)
+
 ## Further Reading
 
 - [`docs/project-overview.md`](docs/project-overview.md) — detailed architecture, data flow, component internals, and known constraints
 - [`docs/gsm-hat-setup.md`](docs/gsm-hat-setup.md) — full GPIO vs USB setup guide for the Waveshare GSM HAT, including debugging history
+- [`docs/thermal-camera-setup.md`](docs/thermal-camera-setup.md) — wiring, config.txt changes, pysenxor installation, and troubleshooting for the MI48 thermal camera
 
 ## Troubleshooting
 
