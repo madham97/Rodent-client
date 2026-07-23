@@ -19,7 +19,7 @@ from senxor.utils import data_to_frame
 OUT = sys.argv[1] if len(sys.argv) > 1 else "/opt/Rodent-client/thermal.png"
 WARMUP_FRAMES = 5
 
-mi48, cs = make_mi48(fps=9)
+mi48, cs = make_mi48(fps=9, spi_speed_hz=2_000_000)
 mi48.start(stream=True, with_header=True)
 
 print(f"Warming up ({WARMUP_FRAMES} frames)...")

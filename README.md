@@ -98,8 +98,14 @@ Key settings:
 - `recording.motion_cooldown` — seconds to wait after a capture before checking for motion again
 - `recording.image_interval` — seconds between captures in interval mode
 - `recording.image_quality` — JPEG quality 1–100 (default 75)
+- `recording.image_rotation` — software rotation in degrees clockwise (`0`/`90`/`180`/`270`) to correct how the CSI camera is physically mounted. `rpicam-still` only supports 0/180 in hardware, so 90/270 mounts need this. Unlike `--hflip`/`--vflip`, a rotation preserves left/right handedness — important once this feed is paired with the thermal feed (see [Thermal Camera](#thermal-camera))
 - `recording.width` / `recording.height` — capture resolution (default 1280×720)
 - `recording.motion_debug` — set `true` to log the motion ratio on every check, useful for tuning `motion_threshold`
+- `recording.thermal_enabled` — fuse the GPIO thermal camera into every capture (default `false`, see [Thermal Camera](#thermal-camera))
+- `recording.thermal_fps` / `recording.thermal_filters` / `recording.thermal_offset` — thermal sensor stream settings
+- `recording.thermal_width` / `recording.thermal_height` — thermal frame size before it's resized to match the visible capture
+- `recording.thermal_spi_speed_hz` — SPI clock speed to the thermal sensor (default 2,000,000 = 2 MHz); lower it if the log shows frequent CRC errors (see [Thermal Camera](#thermal-camera))
+- `recording.thermal_hflip` / `recording.thermal_vflip` — flip the thermal frame so it agrees with the visible frame's left/right and up/down. The MI48's readout orientation is independent of the CSI camera's, so this needs to be set from an actual test (see [Thermal Camera](#thermal-camera)), not assumed
 
 Restart the relevant service after any change:
 ```bash
@@ -178,12 +184,43 @@ ssh root@<tailscale-ip>
 
 ## Thermal Camera
 
-An optional Waveshare MI48 80×62 thermal camera can be attached via GPIO (I2C + SPI). When connected it supplements the IR camera with a thermal heat map.
+An optional Waveshare MI48 80×62 thermal camera can be attached via GPIO (I2C + SPI), alongside the CSI ribbon IR camera the recorder already uses. The two cameras are independent hardware (different buses — CSI vs I2C/SPI) so they can run at the same time with no conflict.
+
+**Combined feed (recorder integration)**
+
+Set `recording.thermal_enabled: true` in `client.json` and restart the recorder service. The MI48 sensor then streams continuously in a background thread inside `recorder.py`; every visible-camera capture (motion or interval) is fused with whatever thermal frame is currently buffered:
+
+- Output changes from `image_*.jpg` to `image_*.png` — an RGBA image where R/G/B is the visible frame and **the normalized thermal frame is stored as the alpha channel**.
+- The sidecar JSON gets `format: "rgba_thermal_alpha"` plus `thermal_min_c` / `thermal_max_c` / `thermal_avg_c` — the actual °C range the alpha byte was normalized from, needed to reconstruct real temperatures server-side: `temp_c = thermal_min_c + (alpha / 255) * (thermal_max_c - thermal_min_c)`.
+- If the sensor fails to init or hasn't produced a frame yet, capture falls back to a plain JPEG (`format: "rgb"`) rather than blocking — a thermal hiccup never stops the visible-camera pipeline.
+- The uploader's WebP compression (`webp_compress`) applies to fused PNGs too and preserves the alpha channel, keeping combined captures well under the SIM800's 300KB upload limit.
+
+**Aligning the two feeds (rotation and mirroring)**
+
+The CSI ribbon camera and the GPIO thermal sensor are independent hardware with independent, arbitrary mounting/readout orientations — there's no default that's correct for every unit. Two separate corrections may be needed, and they're not interchangeable:
+
+- **`recording.image_rotation`** (0/90/180/270, applies to the visible feed) — corrects the CSI camera's physical mounting angle. `rpicam-still` only supports 0/180 in hardware, so 90/270 mounts need this software rotation. A rotation *preserves* left/right handedness.
+- **`recording.thermal_hflip`** / **`thermal_vflip`** (applies to the thermal feed) — corrects the MI48's readout orientation, which is independent of the camera's mounting. A flip *reverses* left/right handedness — that's a fundamentally different kind of correction than a rotation, and one doesn't substitute for the other.
+
+Figure out both empirically, don't guess:
+1. Set `image_rotation` first: capture a frame and check the visible image is upright. Test all 4 values if needed.
+2. Once the visible frame is upright, run `record_combined.py` and raise **one specific hand** (note which). Check the RGB pane: for a camera facing you (not a mirror/selfie view), your right hand should appear on the image's *left* side — that's the correct, unmirrored convention for a monitoring camera. If it's backwards, that means the visible feed itself needs a hardware/software hflip too (not covered by `image_rotation`).
+3. Compare the thermal pane to the now-correct RGB pane in the same frame: does the warm blob (your raised hand) line up on the same side as the RGB hand? If not, toggle `thermal_hflip` (or `thermal_vflip` if it's an up/down mismatch instead) and re-test until they agree.
+
+**CRC errors / dropped thermal frames**
+
+The MI48's SPI link is CRC-checked in hardware, and jumper-wire connections routinely corrupt a transfer here and there — you'll see `MI48 Frame CRC error` in the log. `read_frame()` (`pi-client/thermal/thermal_common.py`) now retries a corrupted read a couple of times before giving up, and the default SPI clock was dropped from 4 MHz to 2 MHz, which should clear up occasional errors. If they're still frequent:
+- Lower `recording.thermal_spi_speed_hz` further (e.g. `1000000` for 1 MHz) — slower but more reliable over jumper wires.
+- Shorten the SPI wiring (MOSI/MISO/CLK) or use twisted-pair/ribbon jumpers instead of loose single-strand wires.
+- Move to a direct PCB mount if you need to go back up to higher speeds.
+
+**Standalone thermal-only tools** (unaffected by the above, useful for testing the sensor in isolation):
 
 | Script | Purpose |
 |--------|---------|
 | `pi-client/thermal/snapshot.py` | Capture one frame → PNG |
-| `pi-client/thermal/record_video.py` | Record N seconds → MP4 |
+| `pi-client/thermal/record_video.py` | Record N seconds → MP4 (thermal only) |
+| `pi-client/thermal/record_combined.py` | Record both cameras simultaneously → single side-by-side MP4 (RGB left, thermal right) |
 
 Quick test (run from a writable directory):
 
@@ -191,6 +228,10 @@ Quick test (run from a writable directory):
 cd ~
 python3 /opt/Rodent-client/pi-client/thermal/snapshot.py
 # opens /opt/Rodent-client/thermal.png
+
+python3 /opt/Rodent-client/pi-client/thermal/record_combined.py --duration 10
+# opens /opt/Rodent-client/combined.mp4 — RGB feed and thermal feed recorded at the same
+# time (rpicam-vid + thermal thread in parallel) and muxed side by side
 ```
 
 Full wiring, config, and installation instructions: [`docs/thermal-camera-setup.md`](docs/thermal-camera-setup.md)

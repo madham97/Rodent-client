@@ -24,12 +24,14 @@ def parse_args():
     p.add_argument('--fps',      '-f', type=int,   default=9,   help='sensor frame rate (1-25)')
     p.add_argument('--width',         type=int,   default=480)
     p.add_argument('--height',        type=int,   default=372)
+    p.add_argument('--spi-speed',     type=int,   default=2_000_000,
+                    help='thermal SPI clock speed in Hz — lower if you see CRC errors (default 2 MHz)')
     return p.parse_args()
 
 args = parse_args()
 WARMUP_FRAMES = 5
 
-mi48, cs = make_mi48(fps=args.fps)
+mi48, cs = make_mi48(fps=args.fps, spi_speed_hz=args.spi_speed)
 mi48.start(stream=True, with_header=True)
 
 writer = cv.VideoWriter(

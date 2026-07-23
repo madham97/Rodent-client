@@ -133,7 +133,8 @@ class SMSConfigHandler:
 
 
 def _to_webp(file_path: Path, quality: int) -> tuple[bytes, str]:
-    """Re-encode a JPEG as WebP in memory. Returns (webp_bytes, webp_filename)."""
+    """Re-encode a JPEG or PNG as WebP in memory. Alpha channels (e.g. thermal-fused RGBA
+    PNGs) survive the conversion since WebP supports alpha. Returns (webp_bytes, webp_filename)."""
     from PIL import Image
     import io
     with Image.open(file_path) as img:
@@ -148,7 +149,8 @@ def build_multipart(file_path: Path, metadata: dict = None, webp_compress: bool 
         metadata = {}
 
     is_jpeg = file_path.suffix.lower() in ('.jpg', '.jpeg')
-    if is_jpeg and webp_compress:
+    is_png  = file_path.suffix.lower() == '.png'
+    if (is_jpeg or is_png) and webp_compress:
         data, filename = _to_webp(file_path, webp_quality)
         content_type = 'image/webp'
     else:
@@ -156,7 +158,9 @@ def build_multipart(file_path: Path, metadata: dict = None, webp_compress: bool 
         content_type = 'image/jpeg' if is_jpeg else 'image/png'
 
     body = b''
-    for key in ('device_id', 'mode', 'motion_score', 'timestamp'):
+    always_keys    = ('device_id', 'mode', 'motion_score', 'timestamp')
+    optional_keys  = ('format', 'thermal_min_c', 'thermal_max_c', 'thermal_avg_c')
+    for key in always_keys + tuple(k for k in optional_keys if k in metadata):
         value = str(metadata.get(key, ''))
         body += (
             f'--{BOUNDARY}\r\n'

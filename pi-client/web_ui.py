@@ -374,6 +374,21 @@ HTML = r"""<!DOCTYPE html>
               <tbody>
                 <tr><td class="text-nowrap pe-2"><code>image_interval</code></td><td class="text-muted">Seconds between captures in <code>image_interval</code> mode</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>image_quality</code></td><td class="text-muted">JPEG quality (1–100, default 85)</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>image_rotation</code></td><td class="text-muted">Software rotation in degrees clockwise (0/90/180/270) to correct how the CSI camera is physically mounted — corrects orientation without mirroring left/right</td></tr>
+              </tbody>
+            </table>
+
+            <p class="fw-semibold mb-1 text-uppercase" style="font-size:0.7rem;letter-spacing:.05em">Thermal Fusion</p>
+            <table class="table table-sm table-borderless" style="font-size:0.82rem">
+              <tbody>
+                <tr><td class="text-nowrap pe-2"><code>thermal_enabled</code></td><td class="text-muted">Stream the GPIO thermal sensor and fuse it into captures as an alpha channel (true/false)</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_fps</code></td><td class="text-muted">Thermal sensor frame rate (1–25, default 9)</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_filters</code></td><td class="text-muted">Enable on-chip spatial filters for a cleaner thermal image (true/false)</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_offset</code></td><td class="text-muted">Global temperature offset correction in °C (default 0.0)</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_warmup_frames</code></td><td class="text-muted">Frames discarded after sensor start before it's considered ready</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_width</code> / <code>thermal_height</code></td><td class="text-muted">Thermal frame size before it's resized to match the visible capture</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_spi_speed_hz</code></td><td class="text-muted">SPI clock speed to the thermal sensor (default 2,000,000 = 2 MHz) — lower if the log shows frequent CRC errors</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_hflip</code> / <code>thermal_vflip</code></td><td class="text-muted">Flip the thermal frame so it agrees with the (correctly rotated) visible frame on left/right and up/down — set based on a real test, not guessed</td></tr>
               </tbody>
             </table>
 
