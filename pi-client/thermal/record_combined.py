@@ -43,9 +43,9 @@ def parse_args():
     p.add_argument('--rpicam-vid-path', default='rpicam-vid')
     p.add_argument('--spi-speed', type=int, default=2_000_000,
                     help='thermal SPI clock speed in Hz — lower if you see CRC errors (default 2 MHz)')
-    p.add_argument('--rgb-rotate', type=int, default=90, choices=(0, 90, 180, 270),
+    p.add_argument('--rgb-rotate', type=int, default=180, choices=(0, 90, 180, 270),
                     help='clockwise rotation to apply to the RGB frame in software, correcting for how the '
-                         'CSI ribbon camera is physically mounted (default 90 — rpicam-vid/still only support '
+                         'CSI ribbon camera is physically mounted (default 180 — rpicam-vid/still only support '
                          '0/180 in hardware, so anything else needs a software rotation here). A rotation, '
                          'unlike a flip, preserves left/right handedness, so getting this right is what keeps '
                          'a raised hand reading as the same hand in both panes.')

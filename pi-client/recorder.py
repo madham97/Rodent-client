@@ -303,7 +303,9 @@ class Recorder:
         from PIL import Image
         with Image.open(jpg_path) as img:
             rotated = img.rotate(-self.image_rotation, expand=True)
-            rotated.save(jpg_path, quality=self.image_quality)
+            # jpg_path is the ".jpg.tmp" working file, so PIL can't infer the encoder from the
+            # extension — pass it explicitly.
+            rotated.save(jpg_path, format='JPEG', quality=self.image_quality)
 
     def _fuse_thermal(self, visible_path: Path):
         """

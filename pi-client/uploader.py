@@ -132,18 +132,52 @@ class SMSConfigHandler:
         return reply
 
 
-def _to_webp(file_path: Path, quality: int) -> tuple[bytes, str]:
+def _to_webp(file_path: Path, quality: int, max_bytes: int = None) -> tuple[bytes, str]:
     """Re-encode a JPEG or PNG as WebP in memory. Alpha channels (e.g. thermal-fused RGBA
-    PNGs) survive the conversion since WebP supports alpha. Returns (webp_bytes, webp_filename)."""
+    PNGs) survive the conversion since WebP supports alpha. Returns (webp_bytes, webp_filename).
+
+    If max_bytes is given, keep the result within it: encode at the requested quality, then, if
+    that overshoots, progressively lower quality and finally downscale until it fits. Fused
+    thermal frames vary in size with scene detail, so a fixed quality can't guarantee they clear
+    the modem's HTTP buffer — this adapts per image. Best-effort: if even the smallest attempt is
+    over, the smallest is returned and the caller enforces the hard cap."""
     from PIL import Image
     import io
-    with Image.open(file_path) as img:
+
+    def encode(im, q):
         buf = io.BytesIO()
-        img.save(buf, format='WEBP', quality=quality)
-        return buf.getvalue(), file_path.stem + '.webp'
+        im.save(buf, format='WEBP', quality=q)
+        return buf.getvalue()
+
+    with Image.open(file_path) as img:
+        img.load()
+        name = file_path.stem + '.webp'
+        data = encode(img, quality)
+        if max_bytes is None or len(data) <= max_bytes:
+            return data, name
+
+        # 1) Lower quality at full resolution.
+        for q in (60, 45, 30):
+            if q < quality:
+                data = encode(img, q)
+                if len(data) <= max_bytes:
+                    logger.info(f"{file_path.name}: compressed to fit at webp q{q} ({len(data)} bytes)")
+                    return data, name
+
+        # 2) Still over — downscale (from the original each step) at the quality floor.
+        for scale in (0.75, 0.6, 0.5, 0.4):
+            w, h = max(1, int(img.width * scale)), max(1, int(img.height * scale))
+            data = encode(img.resize((w, h)), 40)
+            if len(data) <= max_bytes:
+                logger.info(f"{file_path.name}: compressed to fit at {int(scale*100)}% scale ({len(data)} bytes)")
+                return data, name
+
+        logger.warning(f"{file_path.name}: could not compress under {max_bytes} bytes (smallest {len(data)})")
+        return data, name
 
 
-def build_multipart(file_path: Path, metadata: dict = None, webp_compress: bool = False, webp_quality: int = 80) -> bytes:
+def build_multipart(file_path: Path, metadata: dict = None, webp_compress: bool = False,
+                    webp_quality: int = 80, max_image_bytes: int = None) -> bytes:
     """Wrap image file in a multipart/form-data body with metadata text fields."""
     if metadata is None:
         metadata = {}
@@ -151,7 +185,7 @@ def build_multipart(file_path: Path, metadata: dict = None, webp_compress: bool 
     is_jpeg = file_path.suffix.lower() in ('.jpg', '.jpeg')
     is_png  = file_path.suffix.lower() == '.png'
     if (is_jpeg or is_png) and webp_compress:
-        data, filename = _to_webp(file_path, webp_quality)
+        data, filename = _to_webp(file_path, webp_quality, max_bytes=max_image_bytes)
         content_type = 'image/webp'
     else:
         data, filename = file_path.read_bytes(), file_path.name
@@ -441,6 +475,12 @@ class Uploader:
 
         self.outbox_dir.mkdir(parents=True, exist_ok=True)
         self.uploaded_dir.mkdir(parents=True, exist_ok=True)
+        # Files that exhaust their retries are parked here so a single un-acceptable image (e.g.
+        # one the server 500s on) never blocks the oldest-first queue behind it. Kept, not
+        # deleted, so they can be re-sent once the server accepts them. Nested under outbox but
+        # ignored by _get_oldest_file (it is non-recursive and file-only).
+        self.failed_dir = self.outbox_dir / 'failed'
+        self.failed_dir.mkdir(parents=True, exist_ok=True)
 
         self.webp_compress = bool(config.get('webp_compress', False))
         self.webp_quality  = int(config.get('webp_quality', 80))
@@ -473,30 +513,33 @@ class Uploader:
             logger.error(f"Error reading outbox: {e}")
             return None
 
-    def _upload(self, file_path: Path, metadata: dict, attempt=0) -> bool:
-        size = file_path.stat().st_size
-        logger.info(f"Uploading {file_path.name} ({size} bytes, attempt {attempt + 1})")
+    def _upload(self, file_path: Path, metadata: dict, attempt=0) -> str:
+        """Attempt one upload. Returns 'ok' (sent), 'toobig' (won't fit even after adaptive
+        compression — don't retry), or 'retry' (transient/server failure, retry may help)."""
+        # Build the body first so the size check sees the actual POST payload the modem must
+        # buffer — i.e. the WebP-compressed image, not the raw file. Give the image a byte budget
+        # under the HTTP buffer (leaving margin for the multipart boundaries and metadata fields)
+        # so build_multipart can adaptively compress a bulky thermal frame to fit.
+        budget       = MAX_FILE_BYTES - 8192
+        body         = build_multipart(file_path, metadata, self.webp_compress,
+                                       self.webp_quality, max_image_bytes=budget)
+        content_type = f'multipart/form-data; boundary={BOUNDARY}'
+        size = len(body)
+        logger.info(f"Uploading {file_path.name} ({size} bytes payload, attempt {attempt + 1})")
         t0 = time.time()
 
         if size > MAX_FILE_BYTES:
             logger.error(
-                f"{file_path.name} is {size} bytes — exceeds SIM800 HTTP buffer "
-                f"({MAX_FILE_BYTES} bytes). Moving aside and skipping."
+                f"{file_path.name} payload is {size} bytes — exceeds SIM800 HTTP buffer "
+                f"({MAX_FILE_BYTES} bytes) even after adaptive compression."
             )
-            try:
-                shutil.move(str(file_path), str(self.uploaded_dir / file_path.name))
-            except FileNotFoundError:
-                pass  # already moved externally
-            return True
-
-        body         = build_multipart(file_path, metadata, self.webp_compress, self.webp_quality)
-        content_type = f'multipart/form-data; boundary={BOUNDARY}'
+            return 'toobig'
 
         status = self.modem.http_post(self.upload_url, body, content_type)
         if status == 200:
             elapsed = time.time() - t0
             logger.info(f"Upload successful: {file_path.name} ({elapsed:.1f}s, {size / elapsed / 1024:.1f} KB/s)")
-            return True
+            return 'ok'
 
         logger.warning(f"Upload failed (HTTP {status}): {file_path.name}")
 
@@ -505,7 +548,7 @@ class Uploader:
             logger.info("Attempting to re-open GPRS bearer...")
             self.modem.bearer_open()
 
-        return False
+        return 'retry'
 
     def _process_oldest(self) -> bool:
         oldest = self._get_oldest_file()
@@ -521,7 +564,8 @@ class Uploader:
                 logger.warning(f"Could not read sidecar: {sidecar.name}")
 
         for attempt in range(self.max_retries):
-            if self._upload(oldest, metadata, attempt):
+            result = self._upload(oldest, metadata, attempt)
+            if result == 'ok':
                 try:
                     shutil.move(str(oldest), str(self.uploaded_dir / oldest.name))
                     logger.info(f"Moved to uploaded: {oldest.name}")
@@ -529,12 +573,32 @@ class Uploader:
                 except Exception as e:
                     logger.error(f"Error moving {oldest.name}: {e}")
                 return True
+            if result == 'toobig':
+                # Never fits — park it (kept for re-send) instead of wasting retries or, worse,
+                # dropping it into uploaded/ where it would look delivered.
+                self._park_failed(oldest, sidecar, "too large to send even after compression")
+                return False
             if attempt < self.max_retries - 1:
                 logger.info(f"Retrying in {self.retry_delay}s...")
                 time.sleep(self.retry_delay)
 
-        logger.error(f"Failed to upload {oldest.name} after {self.max_retries} attempts")
+        # Out of retries — park in failed/ so the oldest-first queue keeps flowing instead of
+        # retrying this same file forever and starving everything behind it.
+        self._park_failed(oldest, sidecar, f"failed after {self.max_retries} attempts")
         return False
+
+    def _park_failed(self, image: Path, sidecar: Path, reason: str):
+        """Move an un-sendable image (and its sidecar) into failed/ — kept for later re-send,
+        and out of the active queue so it never blocks the images behind it."""
+        logger.error(f"Parking {image.name} in {self.failed_dir.name}/ ({reason})")
+        try:
+            shutil.move(str(image), str(self.failed_dir / image.name))
+            if sidecar.exists():
+                shutil.move(str(sidecar), str(self.failed_dir / sidecar.name))
+        except FileNotFoundError:
+            pass  # already moved externally — nothing to do
+        except Exception as e:
+            logger.error(f"Error parking {image.name} in {self.failed_dir.name}/: {e}")
 
     def _save_sim_number(self):
         """Query the SIM for its own number and write it to client.json if found."""

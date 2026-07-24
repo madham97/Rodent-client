@@ -24,6 +24,11 @@ coverage.xml
 # Local instance config (never commit — use config/client.json.template)
 config/client.json
 
+# Config backups (may contain secrets like the SIM PIN — never commit)
+config/client.json.live-backup
+*.live-backup
+*.bak
+
 # Web UI credentials (never commit)
 config/webui.env
 
