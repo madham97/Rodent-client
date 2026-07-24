@@ -9,7 +9,7 @@ import sys
 import time
 import serial
 
-CONFIG_PATH = '/opt/monitoring-pipeline/config/client.json'
+CONFIG_PATH = '/opt/Rodent-client/config/client.json'
 READY_TIMEOUT = 30  # seconds to wait for modem to respond to AT
 
 

@@ -9,6 +9,7 @@ the SIM800's built-in AT+HTTP stack. No pppd required.
 import json
 import logging
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -27,47 +28,190 @@ logger = logging.getLogger(__name__)
 
 BOUNDARY = 'PiPipeline'
 MAX_FILE_BYTES = 300_000  # SIM800 internal HTTP buffer limit
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
+
+# Keys settable via SMS. (json_section, type, requires_recorder_restart)
+# section=None means top-level in client.json; 'recording' means the recording sub-dict.
+_SMS_KEY_SPEC = {
+    'motion_threshold':   ('recording', float, False),
+    'motion_cooldown':    ('recording', float, False),
+    'detection_interval': ('recording', float, False),
+    'image_interval':     ('recording', float, False),
+    'image_quality':      ('recording', int,   False),
+    'mode':               ('recording', str,   True),
+    'webp_compress':      (None,        bool,  False),
+    'webp_quality':       (None,        int,   False),
+}
 
 
-def _to_webp(file_path: Path, quality: int) -> tuple[bytes, str]:
-    """Re-encode a JPEG as WebP in memory. Returns (webp_bytes, webp_filename)."""
+class SMSConfigHandler:
+    """Parse and apply config changes delivered via SMS."""
+
+    def __init__(self, config_path: str):
+        self._path = config_path
+
+    def handle(self, text: str) -> str:
+        cmd = text.strip()
+        if cmd.upper() == 'STATUS':
+            return self._status()
+        if cmd.upper().startswith('SET '):
+            return self._apply_set(cmd[4:].strip())
+        return 'ERR: unknown command. Use: SET key=value [key=value ...] or STATUS'
+
+    def _load(self):
+        with open(self._path) as f:
+            return json.load(f)
+
+    def _save(self, cfg):
+        with open(self._path, 'w') as f:
+            json.dump(cfg, f, indent=2)
+            f.write('\n')
+
+    def _status(self) -> str:
+        try:
+            cfg = self._load()
+            rec = cfg.get('recording', {})
+            return (
+                f"mode={rec.get('mode', '?')} "
+                f"threshold={rec.get('motion_threshold', '?')} "
+                f"interval={rec.get('image_interval', '?')} "
+                f"quality={rec.get('image_quality', '?')}"
+            )
+        except Exception as e:
+            return f'ERR: {e}'
+
+    def _apply_set(self, args: str) -> str:
+        pairs = {}
+        for token in args.split():
+            if '=' not in token:
+                return f'ERR: bad syntax "{token}" — use key=value'
+            k, _, v = token.partition('=')
+            k = k.strip().lower()
+            if k not in _SMS_KEY_SPEC:
+                return f'ERR: unknown key "{k}"'
+            pairs[k] = v.strip()
+
+        if not pairs:
+            return 'ERR: no key=value pairs found'
+
+        try:
+            cfg = self._load()
+        except Exception as e:
+            return f'ERR: cannot read config: {e}'
+
+        applied = []
+        needs_restart = False
+
+        for k, v in pairs.items():
+            section, cast, restarts = _SMS_KEY_SPEC[k]
+            try:
+                coerced = v.lower() in ('1', 'true', 'yes') if cast is bool else cast(v)
+            except (ValueError, TypeError):
+                return f'ERR: bad value "{v}" for {k}'
+            target = cfg.setdefault(section, {}) if section else cfg
+            target[k] = coerced
+            applied.append(f'{k}={coerced}')
+            if restarts:
+                needs_restart = True
+
+        try:
+            self._save(cfg)
+        except Exception as e:
+            return f'ERR: cannot write config: {e}'
+
+        reply = 'OK: ' + ' '.join(applied)
+        if needs_restart:
+            try:
+                subprocess.run(
+                    ['sudo', 'systemctl', 'restart', 'monitoring-pipeline-recorder'],
+                    capture_output=True, timeout=10,
+                )
+                reply += ' (recorder restarted)'
+            except Exception as e:
+                reply += f' (restart failed: {e})'
+        return reply
+
+
+def _to_webp(file_path: Path, quality: int, max_bytes: int = None) -> tuple[bytes, str]:
+    """Re-encode a JPEG or PNG as WebP in memory. Alpha channels (e.g. thermal-fused RGBA
+    PNGs) survive the conversion since WebP supports alpha. Returns (webp_bytes, webp_filename).
+
+    If max_bytes is given, keep the result within it: encode at the requested quality, then, if
+    that overshoots, progressively lower quality and finally downscale until it fits. Fused
+    thermal frames vary in size with scene detail, so a fixed quality can't guarantee they clear
+    the modem's HTTP buffer — this adapts per image. Best-effort: if even the smallest attempt is
+    over, the smallest is returned and the caller enforces the hard cap."""
     from PIL import Image
     import io
-    with Image.open(file_path) as img:
+
+    def encode(im, q):
         buf = io.BytesIO()
-        img.save(buf, format='WEBP', quality=quality)
-        return buf.getvalue(), file_path.stem + '.webp'
+        im.save(buf, format='WEBP', quality=q)
+        return buf.getvalue()
+
+    with Image.open(file_path) as img:
+        img.load()
+        name = file_path.stem + '.webp'
+        data = encode(img, quality)
+        if max_bytes is None or len(data) <= max_bytes:
+            return data, name
+
+        # 1) Lower quality at full resolution.
+        for q in (60, 45, 30):
+            if q < quality:
+                data = encode(img, q)
+                if len(data) <= max_bytes:
+                    logger.info(f"{file_path.name}: compressed to fit at webp q{q} ({len(data)} bytes)")
+                    return data, name
+
+        # 2) Still over — downscale (from the original each step) at the quality floor.
+        for scale in (0.75, 0.6, 0.5, 0.4):
+            w, h = max(1, int(img.width * scale)), max(1, int(img.height * scale))
+            data = encode(img.resize((w, h)), 40)
+            if len(data) <= max_bytes:
+                logger.info(f"{file_path.name}: compressed to fit at {int(scale*100)}% scale ({len(data)} bytes)")
+                return data, name
+
+        logger.warning(f"{file_path.name}: could not compress under {max_bytes} bytes (smallest {len(data)})")
+        return data, name
 
 
-def build_multipart(file_path: Path, webp_compress: bool = False, webp_quality: int = 80,
-                    metadata: dict = None) -> bytes:
-    """Wrap file in a multipart/form-data body. Optionally re-encodes JPEGs as WebP for smaller transfer."""
-    is_image = file_path.suffix.lower() in ('.jpg', '.jpeg')
-    if is_image and webp_compress:
-        data, filename = _to_webp(file_path, webp_quality)
-        field        = 'image'
+def build_multipart(file_path: Path, metadata: dict = None, webp_compress: bool = False,
+                    webp_quality: int = 80, max_image_bytes: int = None) -> bytes:
+    """Wrap image file in a multipart/form-data body with metadata text fields."""
+    if metadata is None:
+        metadata = {}
+
+    is_jpeg = file_path.suffix.lower() in ('.jpg', '.jpeg')
+    is_png  = file_path.suffix.lower() == '.png'
+    if (is_jpeg or is_png) and webp_compress:
+        data, filename = _to_webp(file_path, webp_quality, max_bytes=max_image_bytes)
         content_type = 'image/webp'
     else:
         data, filename = file_path.read_bytes(), file_path.name
-        field        = 'image' if is_image else 'video'
-        content_type = 'image/jpeg' if is_image else 'video/mp4'
-    parts = [(
-        f'--{BOUNDARY}\r\n'
-        f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
-        f'Content-Type: {content_type}\r\n'
-        f'\r\n'
-    ).encode() + data]
-    for key, value in (metadata or {}).items():
-        if value is None:
-            continue
-        parts.append((
-            f'\r\n--{BOUNDARY}\r\n'
+        content_type = 'image/jpeg' if is_jpeg else 'image/png'
+
+    body = b''
+    always_keys    = ('device_id', 'mode', 'motion_score', 'timestamp')
+    optional_keys  = ('format', 'thermal_min_c', 'thermal_max_c', 'thermal_avg_c')
+    for key in always_keys + tuple(k for k in optional_keys if k in metadata):
+        value = str(metadata.get(key, ''))
+        body += (
+            f'--{BOUNDARY}\r\n'
             f'Content-Disposition: form-data; name="{key}"\r\n'
             f'\r\n'
-            f'{value}'
-        ).encode())
-    parts.append(f'\r\n--{BOUNDARY}--\r\n'.encode())
-    return b''.join(parts)
+            f'{value}\r\n'
+        ).encode()
+
+    body += (
+        f'--{BOUNDARY}\r\n'
+        f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'
+        f'Content-Type: {content_type}\r\n'
+        f'\r\n'
+    ).encode()
+    body += data
+    body += f'\r\n--{BOUNDARY}--\r\n'.encode()
+    return body
 
 
 class SIM800:
@@ -83,7 +227,7 @@ class SIM800:
     # ── Serial helpers ─────────────────────────────────────────────────────────
 
     def open(self):
-        self._ser = serial.Serial(self.device, self.baud, timeout=2, rtscts=True)
+        self._ser = serial.Serial(self.device, self.baud, timeout=2, rtscts=False)
         logger.info(f"Serial port {self.device} opened")
 
     def close(self):
@@ -162,13 +306,12 @@ class SIM800:
         if not self.wait_ready():
             logger.error("Modem did not respond within timeout")
             return False
-        self._send('ATZ', wait=1)   # factory reset
+        self._send('ATZ', wait=3)   # factory reset — modem needs time to reboot
         self._send('ATE0')          # disable echo
         if not self.unlock_sim():
             return False
         if not self.wait_registered():
             return False
-        self.enable_sms_text_mode()
         logger.info(f"Modem ready. Signal: {self.get_signal()}/31")
         return True
 
@@ -181,44 +324,18 @@ class SIM800:
             pass
         return 0
 
-    # ── SMS ────────────────────────────────────────────────────────────────────
-
-    def enable_sms_text_mode(self):
-        """Switch to text mode so SMS bodies are human-readable strings."""
-        resp = self._send('AT+CMGF=1', wait=0.5)
-        if 'OK' in resp:
-            logger.info("SMS text mode enabled")
-        else:
-            logger.warning(f"SMS text mode failed: {resp!r}")
-
-    def read_sms(self) -> list[tuple[int, str, str]]:
-        """Read all unread SMS messages. Returns list of (index, sender, body)."""
-        resp = self._send('AT+CMGL="REC UNREAD"', wait=2)
-        messages = []
-        lines = resp.splitlines()
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            if line.startswith('+CMGL:'):
-                try:
-                    # +CMGL: <index>,"REC UNREAD","<sender>","","<timestamp>"
-                    parts = line[len('+CMGL:'):].split(',')
-                    index = int(parts[0].strip())
-                    sender = parts[2].strip().strip('"')
-                    # next non-empty line is the message body
-                    i += 1
-                    while i < len(lines) and not lines[i].strip():
-                        i += 1
-                    body = lines[i].strip() if i < len(lines) else ''
-                    messages.append((index, sender, body))
-                except (IndexError, ValueError):
-                    pass
-            i += 1
-        return messages
-
-    def delete_sms(self, index: int):
-        """Delete a message by its SIM slot index."""
-        self._send(f'AT+CMGD={index}', wait=0.5)
+    def get_own_number(self) -> str:
+        """Query the SIM for its own phone number via AT+CNUM.
+        Returns the number string, or '' if the SIM doesn't have one stored."""
+        resp = self._send('AT+CNUM', wait=1)
+        for line in resp.splitlines():
+            if '+CNUM:' in line:
+                parts = line.split(',')
+                if len(parts) >= 2:
+                    number = parts[1].strip().strip('"')
+                    if number:
+                        return number
+        return ''
 
     # ── Bearer (GPRS data connection) ──────────────────────────────────────────
 
@@ -240,6 +357,48 @@ class SIM800:
     def bearer_close(self):
         self._send('AT+SAPBR=0,1', wait=2)
         logger.info("GPRS bearer closed")
+
+    # ── SMS ────────────────────────────────────────────────────────────────────
+
+    def read_pending_sms(self) -> list:
+        """Return list of (index, sender, text) for all stored SMS messages."""
+        self._send('AT+CMGF=1')  # text mode
+        resp = self._send('AT+CMGL="ALL"', wait=2)
+        messages = []
+        lines = [l for l in resp.splitlines() if l.strip()]
+        i = 0
+        while i < len(lines):
+            if lines[i].startswith('+CMGL:'):
+                parts = lines[i].split(',')
+                try:
+                    index  = int(parts[0].split(':')[1].strip())
+                    sender = parts[2].strip().strip('"')
+                except (IndexError, ValueError):
+                    i += 1
+                    continue
+                text = lines[i + 1] if i + 1 < len(lines) else ''
+                messages.append((index, sender, text))
+                i += 2
+            else:
+                i += 1
+        return messages
+
+    def delete_sms(self, index: int):
+        self._send(f'AT+CMGD={index}', wait=0.5)
+
+    def send_sms(self, number: str, text: str) -> bool:
+        """Send an SMS to number. Returns True on success."""
+        self._send('AT+CMGF=1')
+        resp = self._send(f'AT+CMGS="{number}"', wait=1)
+        if '>' not in resp:
+            resp += self._wait_for('>', timeout=5)
+        if '>' not in resp:
+            logger.error("send_sms: modem did not prompt for message text")
+            return False
+        self._ser.write(text.encode('ascii', errors='replace') + b'\x1a')
+        self._ser.flush()
+        result = self._wait_for('+CMGS:', timeout=30)
+        return '+CMGS:' in result
 
     # ── HTTP ───────────────────────────────────────────────────────────────────
 
@@ -305,14 +464,8 @@ class SIM800:
         return 0
 
 
-SMS_CHECK_INTERVAL = 60  # seconds between SMS inbox polls
-
-
 class Uploader:
-    def __init__(self, config, config_path=None):
-        self.config      = config
-        self.config_path = config_path
-
+    def __init__(self, config):
         self.outbox_dir    = Path(config.get('outbox_dir', '/outbox'))
         self.uploaded_dir  = Path(config.get('uploaded_dir', '/uploaded'))
         self.upload_url    = config.get('server_url', 'http://localhost:8000') + '/upload'
@@ -322,16 +475,24 @@ class Uploader:
 
         self.outbox_dir.mkdir(parents=True, exist_ok=True)
         self.uploaded_dir.mkdir(parents=True, exist_ok=True)
+        # Files that exhaust their retries are parked here so a single un-acceptable image (e.g.
+        # one the server 500s on) never blocks the oldest-first queue behind it. Kept, not
+        # deleted, so they can be re-sent once the server accepts them. Nested under outbox but
+        # ignored by _get_oldest_file (it is non-recursive and file-only).
+        self.failed_dir = self.outbox_dir / 'failed'
+        self.failed_dir.mkdir(parents=True, exist_ok=True)
 
         self.webp_compress = bool(config.get('webp_compress', False))
         self.webp_quality  = int(config.get('webp_quality', 80))
-
-        self._last_sms_check = 0.0
 
         self.modem = SIM800(
             device=config.get('gsm_device', '/dev/serial0'),
             pin=config.get('gsm_pin', ''),
             apn=config.get('gsm_apn', 'web.vodafone.de'),
+        )
+
+        self._sms_handler = SMSConfigHandler(
+            config.get('_config_path', '/opt/Rodent-client/config/client.json')
         )
 
         logger.info(f"Uploader initialized. Upload URL: {self.upload_url}")
@@ -342,143 +503,134 @@ class Uploader:
         try:
             items = [
                 p for p in self.outbox_dir.glob('*')
-                if not p.name.endswith('.tmp')
-                and not p.name.endswith('.json')
-                and p.exists()
-                and (not p.is_file() or p.stat().st_size > 0)
+                if p.is_file()
+                and not p.name.endswith('.tmp')
+                and p.suffix.lower() in IMAGE_EXTS
+                and p.stat().st_size > 0
             ]
             return min(items, key=lambda p: p.stat().st_mtime) if items else None
         except Exception as e:
             logger.error(f"Error reading outbox: {e}")
             return None
 
-    def _upload(self, file_path: Path, attempt=0) -> bool:
-        size = file_path.stat().st_size
-        logger.info(f"Uploading {file_path.name} ({size} bytes, attempt {attempt + 1})")
+    def _upload(self, file_path: Path, metadata: dict, attempt=0) -> str:
+        """Attempt one upload. Returns 'ok' (sent), 'toobig' (won't fit even after adaptive
+        compression — don't retry), or 'retry' (transient/server failure, retry may help)."""
+        # Build the body first so the size check sees the actual POST payload the modem must
+        # buffer — i.e. the WebP-compressed image, not the raw file. Give the image a byte budget
+        # under the HTTP buffer (leaving margin for the multipart boundaries and metadata fields)
+        # so build_multipart can adaptively compress a bulky thermal frame to fit.
+        budget       = MAX_FILE_BYTES - 8192
+        body         = build_multipart(file_path, metadata, self.webp_compress,
+                                       self.webp_quality, max_image_bytes=budget)
+        content_type = f'multipart/form-data; boundary={BOUNDARY}'
+        size = len(body)
+        logger.info(f"Uploading {file_path.name} ({size} bytes payload, attempt {attempt + 1})")
         t0 = time.time()
 
         if size > MAX_FILE_BYTES:
             logger.error(
-                f"{file_path.name} is {size} bytes — exceeds SIM800 HTTP buffer "
-                f"({MAX_FILE_BYTES} bytes). Moving aside and skipping."
+                f"{file_path.name} payload is {size} bytes — exceeds SIM800 HTTP buffer "
+                f"({MAX_FILE_BYTES} bytes) even after adaptive compression."
             )
-            try:
-                shutil.move(str(file_path), str(self.uploaded_dir / file_path.name))
-            except FileNotFoundError:
-                pass  # already moved externally
-            return True
-
-        sidecar = file_path.with_suffix('.json')
-        metadata = None
-        if sidecar.exists():
-            try:
-                with open(sidecar) as f:
-                    metadata = json.load(f)
-            except Exception as e:
-                logger.warning(f"Could not read sidecar {sidecar.name}: {e}")
-
-        body         = build_multipart(file_path, self.webp_compress, self.webp_quality, metadata)
-        content_type = f'multipart/form-data; boundary={BOUNDARY}'
+            return 'toobig'
 
         status = self.modem.http_post(self.upload_url, body, content_type)
         if status == 200:
             elapsed = time.time() - t0
             logger.info(f"Upload successful: {file_path.name} ({elapsed:.1f}s, {size / elapsed / 1024:.1f} KB/s)")
-            sidecar.unlink(missing_ok=True)
-            return True
+            return 'ok'
 
         logger.warning(f"Upload failed (HTTP {status}): {file_path.name}")
 
-        # 0 = parse failure, 601 = SIM800 network error — re-open bearer
-        if status in (0, 601):
+        # 0 = parse failure, 601/603 = SIM800 network error — re-open bearer
+        if status in (0, 601, 603):
             logger.info("Attempting to re-open GPRS bearer...")
             self.modem.bearer_open()
 
-        return False
+        return 'retry'
 
     def _process_oldest(self) -> bool:
         oldest = self._get_oldest_file()
         if not oldest:
             return False
 
+        sidecar = oldest.with_suffix('.json')
+        metadata = {}
+        if sidecar.exists():
+            try:
+                metadata = json.loads(sidecar.read_text())
+            except Exception:
+                logger.warning(f"Could not read sidecar: {sidecar.name}")
+
         for attempt in range(self.max_retries):
-            if self._upload(oldest, attempt):
+            result = self._upload(oldest, metadata, attempt)
+            if result == 'ok':
                 try:
                     shutil.move(str(oldest), str(self.uploaded_dir / oldest.name))
                     logger.info(f"Moved to uploaded: {oldest.name}")
+                    sidecar.unlink(missing_ok=True)
                 except Exception as e:
                     logger.error(f"Error moving {oldest.name}: {e}")
                 return True
+            if result == 'toobig':
+                # Never fits — park it (kept for re-send) instead of wasting retries or, worse,
+                # dropping it into uploaded/ where it would look delivered.
+                self._park_failed(oldest, sidecar, "too large to send even after compression")
+                return False
             if attempt < self.max_retries - 1:
                 logger.info(f"Retrying in {self.retry_delay}s...")
                 time.sleep(self.retry_delay)
 
-        logger.error(f"Failed to upload {oldest.name} after {self.max_retries} attempts")
+        # Out of retries — park in failed/ so the oldest-first queue keeps flowing instead of
+        # retrying this same file forever and starving everything behind it.
+        self._park_failed(oldest, sidecar, f"failed after {self.max_retries} attempts")
         return False
 
-    def _deep_merge(self, base: dict, patch: dict) -> dict:
-        """Recursively merge patch into base, returning a new dict."""
-        result = base.copy()
-        for key, value in patch.items():
-            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-                result[key] = self._deep_merge(result[key], value)
-            else:
-                result[key] = value
-        return result
+    def _park_failed(self, image: Path, sidecar: Path, reason: str):
+        """Move an un-sendable image (and its sidecar) into failed/ — kept for later re-send,
+        and out of the active queue so it never blocks the images behind it."""
+        logger.error(f"Parking {image.name} in {self.failed_dir.name}/ ({reason})")
+        try:
+            shutil.move(str(image), str(self.failed_dir / image.name))
+            if sidecar.exists():
+                shutil.move(str(sidecar), str(self.failed_dir / sidecar.name))
+        except FileNotFoundError:
+            pass  # already moved externally — nothing to do
+        except Exception as e:
+            logger.error(f"Error parking {image.name} in {self.failed_dir.name}/: {e}")
 
-    def _apply_config_patch(self, patch: dict):
-        """Merge patch into the live config, update live settings, and persist to disk."""
-        self.config = self._deep_merge(self.config, patch)
+    def _save_sim_number(self):
+        """Query the SIM for its own number and write it to client.json if found."""
+        number = self.modem.get_own_number()
+        if not number:
+            logger.info("SIM own number not available (not stored on this SIM)")
+            return
+        try:
+            cfg_path = self._sms_handler._path
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            if cfg.get('gsm_number') == number:
+                return
+            cfg['gsm_number'] = number
+            with open(cfg_path, 'w') as f:
+                json.dump(cfg, f, indent=2)
+                f.write('\n')
+            logger.info(f"SIM number saved to config: {number}")
+        except Exception as e:
+            logger.warning(f"Could not save SIM number to config: {e}")
 
-        # Apply uploader settings that can take effect without a restart
-        if 'poll_interval' in patch:
-            self.poll_interval = int(patch['poll_interval'])
-        if 'max_retries' in patch:
-            self.max_retries = int(patch['max_retries'])
-        if 'retry_delay' in patch:
-            self.retry_delay = int(patch['retry_delay'])
-        if 'webp_compress' in patch:
-            self.webp_compress = bool(patch['webp_compress'])
-        if 'webp_quality' in patch:
-            self.webp_quality = int(patch['webp_quality'])
-
-        if self.config_path:
-            try:
-                with open(self.config_path, 'w') as f:
-                    json.dump(self.config, f, indent=2)
-                logger.info(f"Config saved to {self.config_path}")
-            except Exception as e:
-                logger.error(f"Failed to save config: {e}")
-
-        if any(k in patch for k in ('recording', 'gsm_device', 'gsm_apn')):
-            logger.info("Recording/GSM settings updated — restarting recorder service...")
-            try:
-                import subprocess
-                subprocess.run(
-                    ['systemctl', 'restart', 'monitoring-pipeline-recorder'],
-                    check=True, timeout=15,
-                )
-                logger.info("Recorder service restarted successfully")
-            except Exception as e:
-                logger.error(f"Failed to restart recorder service: {e}")
-
-    def _check_sms_config(self):
-        """Poll the SMS inbox and apply any JSON config patches found."""
-        messages = self.modem.read_sms()
-        for index, sender, body in messages:
-            logger.info(f"SMS from {sender}: {body!r}")
-            try:
-                patch = json.loads(body)
-                if not isinstance(patch, dict):
-                    raise ValueError("SMS body must be a JSON object")
-                self._apply_config_patch(patch)
-                logger.info(f"Config updated via SMS from {sender}: keys={list(patch.keys())}")
-            except json.JSONDecodeError:
-                logger.warning(f"SMS from {sender} is not valid JSON — ignoring")
-            except Exception as e:
-                logger.warning(f"Failed to apply SMS config from {sender}: {e}")
-            finally:
+    def _check_sms(self):
+        try:
+            messages = self.modem.read_pending_sms()
+            for index, sender, text in messages:
+                logger.info(f"SMS from {sender}: {text!r}")
+                reply = self._sms_handler.handle(text)
+                logger.info(f"SMS reply to {sender}: {reply!r}")
+                self.modem.send_sms(sender, reply)
                 self.modem.delete_sms(index)
+        except Exception as e:
+            logger.error(f"SMS check error: {e}")
 
     def run(self):
         self.modem.open()
@@ -493,11 +645,8 @@ class Uploader:
 
             logger.info("Uploader running.")
             while True:
-                if time.time() - self._last_sms_check >= SMS_CHECK_INTERVAL:
-                    self._last_sms_check = time.time()
-                    self._check_sms_config()
-
                 processed = self._process_oldest()
+                self._check_sms()
                 time.sleep(2 if processed else self.poll_interval)
 
         except KeyboardInterrupt:
@@ -506,16 +655,21 @@ class Uploader:
             logger.critical(f"Fatal error: {e}")
             sys.exit(1)
         finally:
-            self.modem.bearer_close()
+            try:
+                self.modem.bearer_close()
+            except Exception:
+                pass
             self.modem.close()
 
 
 def load_config(path=None):
     if path is None:
-        path = '/opt/monitoring-pipeline/config/client.json'
+        path = '/opt/Rodent-client/config/client.json'
     try:
         with open(path) as f:
-            return json.load(f)
+            cfg = json.load(f)
+            cfg['_config_path'] = path
+            return cfg
     except Exception as e:
         logger.warning(f"Failed to load config {path}: {e} — using defaults")
     return {
@@ -525,6 +679,7 @@ def load_config(path=None):
         'max_retries':   3,
         'retry_delay':   60,
         'poll_interval': 10,
+        '_config_path':  path,
     }
 
 
@@ -533,4 +688,4 @@ if __name__ == '__main__':
     if len(sys.argv) > 2 and sys.argv[1] == '--config':
         cfg_path = sys.argv[2]
 
-    Uploader(load_config(cfg_path), config_path=cfg_path).run()
+    Uploader(load_config(cfg_path)).run()

@@ -15,7 +15,7 @@ from flask import Flask, request, Response, jsonify
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-CONFIG_PATH = Path(os.environ.get('CONFIG_PATH', '/opt/monitoring-pipeline/config/client.json'))
+CONFIG_PATH = Path(os.environ.get('CONFIG_PATH', '/opt/Rodent-client/config/client.json'))
 LOG_PATH    = Path(os.environ.get('LOG_PATH',    '/var/log/monitoring-pipeline.log'))
 
 SERVICES = {
@@ -86,9 +86,11 @@ def get_tailscale_ip():
 
 
 def dir_stats(path):
-    """Return (file_count, total_bytes) for all media files in path."""
+    """Return (file_count, total_bytes) for image files in path."""
+    IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
     try:
-        files = [p for p in Path(path).iterdir() if p.is_file() and not p.name.startswith('.')]
+        files = [p for p in Path(path).iterdir()
+                 if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
         return len(files), sum(f.stat().st_size for f in files)
     except Exception:
         return 0, 0
@@ -110,16 +112,17 @@ def api_status():
 
     services = {name: get_service_status(svc) for name, svc in SERVICES.items()}
 
-    gsm_device = config.get('gsm_device', '/dev/serial0')
-    signal     = get_gsm_signal()
-    ts_ip      = get_tailscale_ip()
+    gsm_device  = config.get('gsm_device', '/dev/serial0')
+    gsm_number  = config.get('gsm_number', '')
+    signal      = get_gsm_signal()
+    ts_ip       = get_tailscale_ip()
 
     outbox_count, outbox_size     = dir_stats(config.get('outbox_dir',   '/outbox'))
     uploaded_count, uploaded_size = dir_stats(config.get('uploaded_dir', '/uploaded'))
 
     return jsonify(
         services=services,
-        gsm=dict(signal=signal, device=gsm_device),
+        gsm=dict(signal=signal, device=gsm_device, number=gsm_number),
         outbox=dict(count=outbox_count, size=fmt_bytes(outbox_size)),
         uploaded=dict(count=uploaded_count, size=fmt_bytes(uploaded_size)),
         ssh=dict(tailscale_ip=ts_ip),
@@ -223,7 +226,7 @@ HTML = r"""<!DOCTYPE html>
 
 <nav class="navbar navbar-dark mb-4">
   <div class="container-fluid px-4">
-    <span class="navbar-brand mb-0 h1"><i class="bi bi-camera-video-fill"></i> Monitoring Pipeline</span>
+    <span class="navbar-brand mb-0 h1"><i class="bi bi-camera-fill"></i> Monitoring Pipeline</span>
     <span class="text-white-50 small" id="ts"></span>
   </div>
 </nav>
@@ -322,14 +325,14 @@ HTML = r"""<!DOCTYPE html>
             <p class="fw-semibold mb-1 text-uppercase" style="font-size:0.7rem;letter-spacing:.05em">Upload</p>
             <table class="table table-sm table-borderless mb-3" style="font-size:0.82rem">
               <tbody>
-                <tr><td class="text-nowrap pe-2"><code>server_url</code></td><td class="text-muted">Remote server to upload clips to</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>server_url</code></td><td class="text-muted">Remote server to upload images to</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>webp_compress</code></td><td class="text-muted">Re-encode JPEGs as WebP before upload for smaller transfer (true/false). Original JPEG kept on disk.</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>webp_quality</code></td><td class="text-muted">WebP encode quality for upload (1–100, default 80)</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>outbox_dir</code></td><td class="text-muted">Clips wait here before upload</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>uploaded_dir</code></td><td class="text-muted">Clips moved here after successful upload</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>max_retries</code></td><td class="text-muted">Upload attempts before giving up on a clip</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>outbox_dir</code></td><td class="text-muted">Images wait here before upload</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>uploaded_dir</code></td><td class="text-muted">Images moved here after successful upload</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>max_retries</code></td><td class="text-muted">Upload attempts before giving up on a file</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>retry_delay</code></td><td class="text-muted">Seconds between upload retries</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>poll_interval</code></td><td class="text-muted">Seconds between checks for new clips</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>poll_interval</code></td><td class="text-muted">Seconds between checks for new images</td></tr>
               </tbody>
             </table>
 
@@ -338,21 +341,18 @@ HTML = r"""<!DOCTYPE html>
               <tbody>
                 <tr><td class="text-nowrap pe-2"><code>gsm_device</code></td><td class="text-muted">Serial port for the GSM modem</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>gsm_pin</code></td><td class="text-muted">SIM PIN — omit if not required</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>gsm_number</code></td><td class="text-muted">Phone number of the SIM — for reference when sending SMS config commands</td></tr>
               </tbody>
             </table>
 
             <p class="fw-semibold mb-1 text-uppercase" style="font-size:0.7rem;letter-spacing:.05em">Recording</p>
             <table class="table table-sm table-borderless mb-3" style="font-size:0.82rem">
               <tbody>
-                <tr><td class="text-nowrap pe-2"><code>enabled</code></td><td class="text-muted">Enable or disable recording</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>mode</code></td><td class="text-muted"><code>segment</code> continuous video chunks · <code>motion</code> video on movement · <code>image_interval</code> JPEG every N seconds · <code>image_motion</code> JPEG on movement</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>mode</code></td><td class="text-muted"><code>image_motion</code> JPEG on movement · <code>image_interval</code> JPEG every N seconds</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>camera_id</code></td><td class="text-muted">Camera index (0 = default)</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>chunk_duration</code></td><td class="text-muted">Length of each clip in seconds</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>width</code> / <code>height</code></td><td class="text-muted">Recording resolution in pixels</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>framerate</code></td><td class="text-muted">Frames per second</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>bitrate</code></td><td class="text-muted">Encoding bitrate e.g. <code>5Mbps</code></td></tr>
-                <tr><td class="text-nowrap pe-2"><code>min_size_bytes</code></td><td class="text-muted">Minimum file size to treat a clip as valid</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>rpicam_vid_path</code></td><td class="text-muted">Path to rpicam-vid binary</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>width</code> / <code>height</code></td><td class="text-muted">Capture resolution in pixels</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>min_size_bytes</code></td><td class="text-muted">Minimum file size to treat an image as valid</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>rpicam_still_path</code></td><td class="text-muted">Path to rpicam-still binary</td></tr>
               </tbody>
             </table>
 
@@ -374,6 +374,21 @@ HTML = r"""<!DOCTYPE html>
               <tbody>
                 <tr><td class="text-nowrap pe-2"><code>image_interval</code></td><td class="text-muted">Seconds between captures in <code>image_interval</code> mode</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>image_quality</code></td><td class="text-muted">JPEG quality (1–100, default 85)</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>image_rotation</code></td><td class="text-muted">Software rotation in degrees clockwise (0/90/180/270) to correct how the CSI camera is physically mounted — corrects orientation without mirroring left/right</td></tr>
+              </tbody>
+            </table>
+
+            <p class="fw-semibold mb-1 text-uppercase" style="font-size:0.7rem;letter-spacing:.05em">Thermal Fusion</p>
+            <table class="table table-sm table-borderless" style="font-size:0.82rem">
+              <tbody>
+                <tr><td class="text-nowrap pe-2"><code>thermal_enabled</code></td><td class="text-muted">Stream the GPIO thermal sensor and fuse it into captures as an alpha channel (true/false)</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_fps</code></td><td class="text-muted">Thermal sensor frame rate (1–25, default 9)</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_filters</code></td><td class="text-muted">Enable on-chip spatial filters for a cleaner thermal image (true/false)</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_offset</code></td><td class="text-muted">Global temperature offset correction in °C (default 0.0)</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_warmup_frames</code></td><td class="text-muted">Frames discarded after sensor start before it's considered ready</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_width</code> / <code>thermal_height</code></td><td class="text-muted">Thermal frame size before it's resized to match the visible capture</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_spi_speed_hz</code></td><td class="text-muted">SPI clock speed to the thermal sensor (default 2,000,000 = 2 MHz) — lower if the log shows frequent CRC errors</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_hflip</code> / <code>thermal_vflip</code></td><td class="text-muted">Flip the thermal frame so it agrees with the (correctly rotated) visible frame on left/right and up/down — set based on a real test, not guessed</td></tr>
               </tbody>
             </table>
 
@@ -454,7 +469,8 @@ function fetchStatus() {
 
     document.getElementById('gsm').innerHTML =
       `<div class="mb-1">Signal &nbsp;${bars(d.gsm.signal)}</div>
-       <div class="text-muted small mt-1">Device: <code>${d.gsm.device}</code></div>`;
+       <div class="text-muted small mt-1">Device: <code>${d.gsm.device}</code></div>` +
+      (d.gsm.number ? `<div class="text-muted small">SIM number: <code>${d.gsm.number}</code></div>` : '');
 
     document.getElementById('outbox').innerHTML =
       `<span class="fs-3 fw-bold">${d.outbox.count}</span>

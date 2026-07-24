@@ -1,150 +1,254 @@
-# Rodent Client — Edge Device
+# Monitoring Pipeline — Edge Client
 
-Raspberry Pi client for the rodent monitoring pipeline. Captures motion-triggered images via camera, compresses them, and uploads over GSM (SIM800 modem) to the server. Config can be updated remotely by sending a JSON SMS to the device's SIM number.
+Runs on a Raspberry Pi. Captures images (on motion or on a timer), uploads them to the server over a SIM868/SIM800C GSM modem, and exposes a local web dashboard for management.
 
-## Hardware requirements
+## First-time setup
 
-- Raspberry Pi (tested on Pi 4 Model B)
-- Camera module (compatible with `rpicam-still` / `rpicam-vid`)
-- SIM800 GSM HAT connected to GPIO UART (`/dev/serial0`)
-- SIM card with a data plan (GPRS)
-
-## Installation
-
-Clone the repo onto the Pi, then run the install script from the repo root:
+Clone or copy this repo onto the Pi, then run the installer as root from the project directory:
 
 ```bash
 cd /opt/Rodent-client
 sudo bash install.sh
 ```
 
-The script will:
-- Create a Python virtualenv at `/opt/monitoring-pipeline/venv`
-- Install Python dependencies
-- Copy source files and config to `/opt/monitoring-pipeline/`
-- Install and enable Tailscale
-- Register the systemd services (uploader, recorder, web UI)
+The installer will prompt for:
 
-## First-time configuration
+| Prompt | Default | Notes |
+|--------|---------|-------|
+| Server URL | — | Required. Use your server IP, hostname, or ngrok URL |
+| Device ID | hostname | Identifies this Pi in upload metadata |
+| GSM APN | `web.vodafone.de` | Data APN for your SIM card |
+| GSM serial device | `/dev/serial0` | GPIO UART. Use `/dev/ttyUSB0` for USB mode — see `docs/gsm-hat-setup.md` |
+| SIM PIN | *(blank)* | Entered silently with confirmation. Stored in `client.json` (mode 640) |
+| Recording mode | `image_motion` | `1` = JPEG on motion, `2` = JPEG on a timer |
+| Web UI password | `monitoring` | Password for the dashboard at port 8080 |
+| Start services now | yes | Enables and starts all systemd services |
 
-Edit `/opt/monitoring-pipeline/config/client.json` before starting the services:
+The installer:
+- Installs Python dependencies into a venv at `/opt/Rodent-client/venv`
+- Writes `/opt/Rodent-client/config/client.json` and `webui.env`
+- Frees the GPIO serial port (disables serial getty, removes kernel console — harmless if using USB mode)
+- Installs Tailscale for remote access
+- Installs and optionally starts the three core systemd services (recorder, uploader, webui)
 
-```json
-{
-  "server_url": "http://<your-server>:8000",
-  "gsm_pin":    "1234",
-  "gsm_apn":    "web.vodafone.de",
-  "outbox_dir":   "/outbox",
-  "uploaded_dir": "/uploaded",
-  "poll_interval": 10,
-  "max_retries":   3,
-  "retry_delay":   10,
-  "webp_compress": true,
-  "webp_quality":  80,
-  "recording": {
-    "enabled":           true,
-    "mode":              "image_motion",
-    "width":             1280,
-    "height":            720,
-    "framerate":         15,
-    "image_quality":     75,
-    "motion_threshold":  0.015,
-    "motion_cooldown":   60,
-    "detection_interval": 1
-  }
-}
+Re-running `install.sh` is safe — it loads existing values as defaults.
+
+## How it works
+
 ```
-
-Then authenticate Tailscale for remote web UI access:
-
-```bash
-sudo tailscale up
-# open the printed URL in a browser to authorise the device
-tailscale ip -4   # note this IP for web UI access
+rpicam-still → /outbox/image_YYYYMMDDThhmmssZ.jpg
+                          + .json sidecar (device_id, mode, timestamp, motion_score)
+                    ↓
+              uploader reads oldest image + sidecar
+              → multipart POST to server /upload
+              → moves image to /uploaded, deletes sidecar
 ```
-
-**Ensure the GSM HAT is powered on** before starting the services.
-
-## Starting the services
-
-```bash
-sudo systemctl start monitoring-pipeline-recorder.service \
-                     monitoring-pipeline-uploader.service \
-                     monitoring-pipeline-webui.service
-```
-
-All three services are enabled at boot after install.
 
 ## Services
 
-| Service | Description |
-|---|---|
-| `monitoring-pipeline-recorder` | Captures images/video from the camera into `/outbox` |
-| `monitoring-pipeline-uploader` | Uploads files from `/outbox` to the server via GSM AT+HTTP |
-| `monitoring-pipeline-webui` | Local management dashboard on port 8080 |
+Three core systemd services are installed under the name prefix `monitoring-pipeline-`:
 
-## Recording modes
+| Service | Role |
+|---------|------|
+| `recorder` | Captures images to `/outbox` |
+| `uploader` | Uploads images from `/outbox` to the server via GSM; manages its own GPRS bearer via AT commands |
+| `webui` | Local dashboard at `http://<pi-ip>:8080` |
 
-Set via `recording.mode` in `client.json`:
+Two additional service unit files exist in `systemd/` but are not installed by `install.sh`:
 
-| Mode | Description |
-|---|---|
-| `image_motion` | JPEG captured when motion is detected (default) |
-| `image_interval` | JPEG captured at a fixed interval |
-| `motion` | MP4 clip recorded when motion is detected |
-| `segment` | Continuous fixed-duration MP4 chunks |
+| Service | Role |
+|---------|------|
+| `gsm-pin` | Legacy: one-shot SIM PIN unlock before pppd. Not needed — uploader handles PIN unlock itself. |
+| `gsm` | Legacy: establishes a pppd PPP data connection. Not needed — uploader uses AT+HTTPACTION directly. |
+
+```bash
+# Check status
+sudo systemctl status monitoring-pipeline-recorder
+sudo systemctl status monitoring-pipeline-uploader
+
+# Follow logs
+journalctl -u monitoring-pipeline-uploader -f
+journalctl -u monitoring-pipeline-recorder -f
+
+# Restart after a config change
+sudo systemctl restart monitoring-pipeline-recorder monitoring-pipeline-uploader
+```
+
+## Configuration
+
+Config lives at `/opt/Rodent-client/config/client.json`. It can be edited directly or via the web dashboard (Config tab).
+
+Key settings:
+
+**Upload**
+- `server_url` — server address (e.g. `http://192.168.1.10:8000` or an ngrok URL)
+- `webp_compress` / `webp_quality` — re-encode JPEGs as WebP before upload to reduce transfer size
+- `poll_interval` — seconds between outbox checks (default 10)
+- `max_retries` / `retry_delay` — upload retry behaviour
+
+**GSM**
+- `gsm_device` — serial port: `/dev/serial0` for GPIO UART mode, `/dev/ttyUSB0` for USB mode (see `docs/gsm-hat-setup.md`)
+- `gsm_pin` — SIM PIN (blank if not required)
+- `gsm_apn` — data APN for your carrier
+- `gsm_number` — phone number of the SIM (e.g. `+447700900123`), shown in the dashboard — useful to note here so you know what number to send SMS config commands to
+
+**Recording**
+- `recording.mode` — `image_motion` or `image_interval`
+- `recording.motion_threshold` — fraction of pixels that must change to trigger (0–1, default 0.015)
+- `recording.motion_cooldown` — seconds to wait after a capture before checking for motion again
+- `recording.image_interval` — seconds between captures in interval mode
+- `recording.image_quality` — JPEG quality 1–100 (default 75)
+- `recording.image_rotation` — software rotation in degrees clockwise (`0`/`90`/`180`/`270`) to correct how the CSI camera is physically mounted. `rpicam-still` only supports 0/180 in hardware, so 90/270 mounts need this. Unlike `--hflip`/`--vflip`, a rotation preserves left/right handedness — important once this feed is paired with the thermal feed (see [Thermal Camera](#thermal-camera))
+- `recording.width` / `recording.height` — capture resolution (default 1280×720)
+- `recording.motion_debug` — set `true` to log the motion ratio on every check, useful for tuning `motion_threshold`
+- `recording.thermal_enabled` — fuse the GPIO thermal camera into every capture (default `false`, see [Thermal Camera](#thermal-camera))
+- `recording.thermal_fps` / `recording.thermal_filters` / `recording.thermal_offset` — thermal sensor stream settings
+- `recording.thermal_width` / `recording.thermal_height` — thermal frame size before it's resized to match the visible capture
+- `recording.thermal_spi_speed_hz` — SPI clock speed to the thermal sensor (default 2,000,000 = 2 MHz); lower it if the log shows frequent CRC errors (see [Thermal Camera](#thermal-camera))
+- `recording.thermal_hflip` / `recording.thermal_vflip` — flip the thermal frame so it agrees with the visible frame's left/right and up/down. The MI48's readout orientation is independent of the CSI camera's, so this needs to be set from an actual test (see [Thermal Camera](#thermal-camera)), not assumed
+
+Restart the relevant service after any change:
+```bash
+sudo systemctl restart monitoring-pipeline-recorder  # after recording changes
+sudo systemctl restart monitoring-pipeline-uploader  # after upload/GSM changes
+```
 
 ## Remote config via SMS
 
-Send a JSON patch as a plain SMS to the device's SIM number. Changes are applied within 60 seconds.
+When the Pi has no internet connection, settings can be updated by sending an SMS to the SIM card in the modem. The uploader checks for messages between uploads and replies automatically.
 
-Examples:
+**Commands**
+
+| SMS text | Effect |
+|----------|--------|
+| `SET key=value` | Update one or more settings |
+| `SET key=value key=value ...` | Update multiple settings at once |
+| `STATUS` | Reply with current mode, threshold, interval, and quality |
+
+**Updatable keys**
+
+| Key | Type | Recorder restart? |
+|-----|------|-------------------|
+| `motion_threshold` | float (0–1) | No |
+| `motion_cooldown` | float (seconds) | No |
+| `detection_interval` | float (seconds) | No |
+| `image_interval` | float (seconds) | No |
+| `image_quality` | int (1–100) | No |
+| `mode` | `image_motion` or `image_interval` | Yes — automatic |
+| `webp_compress` | `true` or `false` | No |
+| `webp_quality` | int (1–100) | No |
+
+**Examples**
+
 ```
-{"recording":{"mode":"segment"}}
-{"recording":{"motion_threshold":0.03}}
-{"webp_quality":60,"poll_interval":30}
-{"recording":{"enabled":false}}
+SET motion_threshold=0.05
+SET mode=image_interval image_interval=30
+SET image_quality=70 webp_compress=true webp_quality=65
+STATUS
 ```
 
-Keys under `recording` require the recorder service to restart automatically. Uploader keys (`webp_quality`, `webp_compress`, `poll_interval`, `max_retries`, `retry_delay`) take effect immediately.
+The Pi replies with `OK: key=value ...` on success, or `ERR: ...` describing what went wrong. Changes are written to `client.json` immediately. Keys that require a recorder restart (`mode`) trigger one automatically.
 
-Use the server's `/config-help` page to build and copy SMS patches interactively.
+Messages from any phone number are accepted. The reply is sent back to the sender.
 
-## Upload metadata
+## Web dashboard
 
-Each upload includes a JSON sidecar with:
-- `device_id` — hostname of the Pi
-- `mode` — recording mode that produced the file
-- `motion_score` — fraction of pixels that changed (motion modes only)
-- `timestamp` — UTC capture time
+Accessible at `http://<tailscale-ip>:8080` (or local IP) with the credentials from `webui.env`.
 
-The server logs these to `upload_log.txt`.
+- **Dashboard** — service status, GSM signal strength, outbox/uploaded file counts, Tailscale SSH address
+- **Logs** — live tail of `/var/log/monitoring-pipeline.log`
+- **Config** — edit and save `client.json` in-browser
 
-## Web UI
+## Testing
 
-Accessible at `http://<tailscale-ip>:8080`. Default credentials: `admin` / `monitoring` — change in `/opt/monitoring-pipeline/config/webui.env`.
-
-## Logs
-
+Test image capture and upload (no GSM modem needed — posts directly over HTTP):
 ```bash
-journalctl -u monitoring-pipeline-uploader.service -f
-journalctl -u monitoring-pipeline-recorder.service -f
-```
-
-## Integration test
-
-Verify the full pipeline (camera → GSM → server) after installation:
-
-```bash
-cd /opt/monitoring-pipeline
+cd /opt/Rodent-client
 venv/bin/python3 pi-client/test_record_upload.py
 ```
 
+This captures a test image with `rpicam-still` (or falls back to a 1×1 dummy JPEG if no camera is attached), POSTs it to the configured server URL, and reports success or failure.
+
+## Tailscale
+
+```bash
+sudo tailscale up        # authenticate (follow the printed URL)
+tailscale ip -4          # get the Pi's Tailscale IP
+```
+
+Once connected, the Pi is reachable from any device on your Tailnet:
+```bash
+ssh root@<tailscale-ip>
+# or open http://<tailscale-ip>:8080 for the dashboard
+```
+
+## Thermal Camera
+
+An optional Waveshare MI48 80×62 thermal camera can be attached via GPIO (I2C + SPI), alongside the CSI ribbon IR camera the recorder already uses. The two cameras are independent hardware (different buses — CSI vs I2C/SPI) so they can run at the same time with no conflict.
+
+**Combined feed (recorder integration)**
+
+Set `recording.thermal_enabled: true` in `client.json` and restart the recorder service. The MI48 sensor then streams continuously in a background thread inside `recorder.py`; every visible-camera capture (motion or interval) is fused with whatever thermal frame is currently buffered:
+
+- Output changes from `image_*.jpg` to `image_*.png` — an RGBA image where R/G/B is the visible frame and **the normalized thermal frame is stored as the alpha channel**.
+- The sidecar JSON gets `format: "rgba_thermal_alpha"` plus `thermal_min_c` / `thermal_max_c` / `thermal_avg_c` — the actual °C range the alpha byte was normalized from, needed to reconstruct real temperatures server-side: `temp_c = thermal_min_c + (alpha / 255) * (thermal_max_c - thermal_min_c)`.
+- If the sensor fails to init or hasn't produced a frame yet, capture falls back to a plain JPEG (`format: "rgb"`) rather than blocking — a thermal hiccup never stops the visible-camera pipeline.
+- The uploader's WebP compression (`webp_compress`) applies to fused PNGs too and preserves the alpha channel, keeping combined captures well under the SIM800's 300KB upload limit.
+
+**Aligning the two feeds (rotation and mirroring)**
+
+The CSI ribbon camera and the GPIO thermal sensor are independent hardware with independent, arbitrary mounting/readout orientations — there's no default that's correct for every unit. Two separate corrections may be needed, and they're not interchangeable:
+
+- **`recording.image_rotation`** (0/90/180/270, applies to the visible feed) — corrects the CSI camera's physical mounting angle. `rpicam-still` only supports 0/180 in hardware, so 90/270 mounts need this software rotation. A rotation *preserves* left/right handedness.
+- **`recording.thermal_hflip`** / **`thermal_vflip`** (applies to the thermal feed) — corrects the MI48's readout orientation, which is independent of the camera's mounting. A flip *reverses* left/right handedness — that's a fundamentally different kind of correction than a rotation, and one doesn't substitute for the other.
+
+Figure out both empirically, don't guess:
+1. Set `image_rotation` first: capture a frame and check the visible image is upright. Test all 4 values if needed.
+2. Once the visible frame is upright, run `record_combined.py` and raise **one specific hand** (note which). Check the RGB pane: for a camera facing you (not a mirror/selfie view), your right hand should appear on the image's *left* side — that's the correct, unmirrored convention for a monitoring camera. If it's backwards, that means the visible feed itself needs a hardware/software hflip too (not covered by `image_rotation`).
+3. Compare the thermal pane to the now-correct RGB pane in the same frame: does the warm blob (your raised hand) line up on the same side as the RGB hand? If not, toggle `thermal_hflip` (or `thermal_vflip` if it's an up/down mismatch instead) and re-test until they agree.
+
+**CRC errors / dropped thermal frames**
+
+The MI48's SPI link is CRC-checked in hardware, and jumper-wire connections routinely corrupt a transfer here and there — you'll see `MI48 Frame CRC error` in the log. `read_frame()` (`pi-client/thermal/thermal_common.py`) now retries a corrupted read a couple of times before giving up, and the default SPI clock was dropped from 4 MHz to 2 MHz, which should clear up occasional errors. If they're still frequent:
+- Lower `recording.thermal_spi_speed_hz` further (e.g. `1000000` for 1 MHz) — slower but more reliable over jumper wires.
+- Shorten the SPI wiring (MOSI/MISO/CLK) or use twisted-pair/ribbon jumpers instead of loose single-strand wires.
+- Move to a direct PCB mount if you need to go back up to higher speeds.
+
+**Standalone thermal-only tools** (unaffected by the above, useful for testing the sensor in isolation):
+
+| Script | Purpose |
+|--------|---------|
+| `pi-client/thermal/snapshot.py` | Capture one frame → PNG |
+| `pi-client/thermal/record_video.py` | Record N seconds → MP4 (thermal only) |
+| `pi-client/thermal/record_combined.py` | Record both cameras simultaneously → single side-by-side MP4 (RGB left, thermal right) |
+
+Quick test (run from a writable directory):
+
+```bash
+cd ~
+python3 /opt/Rodent-client/pi-client/thermal/snapshot.py
+# opens /opt/Rodent-client/thermal.png
+
+python3 /opt/Rodent-client/pi-client/thermal/record_combined.py --duration 10
+# opens /opt/Rodent-client/combined.mp4 — RGB feed and thermal feed recorded at the same
+# time (rpicam-vid + thermal thread in parallel) and muxed side by side
+```
+
+Full wiring, config, and installation instructions: [`docs/thermal-camera-setup.md`](docs/thermal-camera-setup.md)
+
+## Further Reading
+
+- [`docs/project-overview.md`](docs/project-overview.md) — detailed architecture, data flow, component internals, and known constraints
+- [`docs/gsm-hat-setup.md`](docs/gsm-hat-setup.md) — full GPIO vs USB setup guide for the Waveshare GSM HAT, including debugging history
+- [`docs/thermal-camera-setup.md`](docs/thermal-camera-setup.md) — wiring, config.txt changes, pysenxor installation, and troubleshooting for the MI48 thermal camera
+
 ## Troubleshooting
 
-| Symptom | Check |
-|---|---|
-| Modem not responding | GSM HAT powered on? Correct device in `gsm_device`? |
-| Uploads not reaching server | `server_url` correct? Signal strength in uploader logs? |
-| No motion captures | `motion_threshold` too high? Check `motion_debug: true` |
-| Web UI unreachable | `tailscale up` authenticated? Check port 8080 is not firewalled |
+| Symptom | Fix |
+|---------|-----|
+| Uploader exits immediately | Check `gsm_device` in config (`/dev/serial0` for GPIO, `/dev/ttyUSB0` for USB); verify SIM PIN |
+| Images not appearing on server | Check `server_url` in config; verify server is reachable (`curl <url>/health`) |
+| `/outbox` growing, nothing uploaded | Check GSM signal in dashboard; check uploader logs |
+| Motion not triggering | Lower `motion_threshold` or enable `motion_debug` to see live ratios |
+| Dashboard not accessible | Check webui service is running; confirm Tailscale is authenticated |
+| SMS commands not working | Confirm modem is registered (`AT+CREG?`); check uploader log for `SMS from` lines; ensure SIM can receive SMS |
