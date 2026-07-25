@@ -30,6 +30,12 @@ BOUNDARY = 'PiPipeline'
 MAX_FILE_BYTES = 300_000  # SIM800 internal HTTP buffer limit
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
 
+
+class ModemLinkError(Exception):
+    """The modem or the serial link to it failed, so we never learned what the server
+    thought of the image. Distinct from an HTTP error: the image itself is fine and must
+    stay queued, not be parked in failed/ as though the server had rejected it."""
+
 # Keys settable via SMS. (json_section, type, requires_recorder_restart)
 # section=None means top-level in client.json; 'recording' means the recording sub-dict.
 _SMS_KEY_SPEC = {
@@ -217,12 +223,19 @@ def build_multipart(file_path: Path, metadata: dict = None, webp_compress: bool 
 class SIM800:
     """SIM800 modem controlled entirely via AT commands over a serial port."""
 
-    def __init__(self, device='/dev/serial0', baud=115200, pin='', apn='web.vodafone.de'):
+    def __init__(self, device='/dev/serial0', baud=115200, pin='', apn='web.vodafone.de',
+                 action_timeout=60):
         self.device = device
         self.baud   = baud
         self.pin    = pin
         self.apn    = apn
         self._ser   = None
+        # How long to wait for +HTTPACTION. Measured round-trips on this link are 26–37 s,
+        # so the old 180 s only ever added dead time: when the USB endpoint stalls the reply
+        # is already lost and no amount of waiting recovers it. A shorter wait means a
+        # stalled cycle costs ~1 minute instead of ~3.5, and the delivery check settles
+        # whether the POST landed.
+        self.action_timeout = action_timeout
 
     # ── Serial helpers ─────────────────────────────────────────────────────────
 
@@ -234,8 +247,38 @@ class SIM800:
         if self._ser and self._ser.is_open:
             self._ser.close()
 
-    def _send(self, cmd, wait=0.4):
-        """Send one AT command, return the raw text response."""
+    def reopen(self, reason="serial read path is dead (USB endpoint stalled)"):
+        """Close and re-open the serial port to recover a one-way link.
+
+        A GPRS data attempt can halt the CP2102's bulk-IN endpoint. The kernel logs
+        `cp210x ttyUSB0: usb_serial_generic_read_bulk_callback - urb stopped: -32`
+        (-EPIPE) and the usb-serial driver then stops resubmitting the read URB, so the
+        file descriptor never delivers another byte — while writes keep succeeding. Every
+        AT command from then on looks like it returned an empty response, forever, and the
+        modem appears dead when it is actually healthy. Re-opening the port gets a fresh
+        URB and restores reads immediately; nothing else does."""
+        logger.warning(f"Re-opening serial port: {reason}")
+        try:
+            self.close()
+        except Exception as e:
+            logger.warning(f"Error closing port during recovery: {e}")
+        time.sleep(0.5)
+        self.open()
+
+    def _send(self, cmd, wait=0.4, heal=True):
+        """Send one AT command, return the raw text response.
+
+        An empty response means the read path died rather than that the modem said
+        nothing, so by default we re-open the port and ask once more. `heal=False` is for
+        commands that must never be sent twice (firing an HTTP POST, sending an SMS) —
+        a silent duplicate is worse there than a lost reply."""
+        resp = self._send_once(cmd, wait)
+        if resp or not heal:
+            return resp
+        self.reopen()
+        return self._send_once(cmd, wait)
+
+    def _send_once(self, cmd, wait):
         self._ser.reset_input_buffer()
         self._ser.write(f'{cmd}\r'.encode())
         time.sleep(wait)
@@ -340,19 +383,26 @@ class SIM800:
     # ── Bearer (GPRS data connection) ──────────────────────────────────────────
 
     def bearer_open(self):
-        """Open the GPRS bearer used by the HTTP stack."""
+        """Open the GPRS bearer used by the HTTP stack.
+
+        Confirms the outcome by querying the bearer rather than trusting the reply to
+        SAPBR=1,1: an already-open bearer answers ERROR, and a dead read path answers
+        nothing at all. Treating either as success made the log claim the bearer was up
+        every 12 seconds while nothing worked."""
         self._send(f'AT+SAPBR=3,1,"Contype","GPRS"')
         self._send(f'AT+SAPBR=3,1,"APN","{self.apn}"')
-        resp = self._send('AT+SAPBR=1,1', wait=5)
-        if 'ERROR' in resp:
-            # Check if it's already open
-            status = self._send('AT+SAPBR=2,1', wait=1)
-            if ',1,' in status:
-                return True
-            logger.error(f"Bearer open failed: {resp}")
+        self._send('AT+SAPBR=1,1', wait=5)
+
+        status = self._send('AT+SAPBR=2,1', wait=1)
+        if '+SAPBR: 1,1' in status:   # <cid>,<status=1 connected>,<ip>
+            ip = status.split('"')[1] if '"' in status else '?'
+            logger.info(f"GPRS bearer open (IP {ip})")
+            return True
+        if not status:
+            logger.error("Bearer status unreadable — modem is not answering")
             return False
-        logger.info("GPRS bearer opened")
-        return True
+        logger.error(f"Bearer is not connected: {status.splitlines()[0] if status else status!r}")
+        return False
 
     def bearer_close(self):
         self._send('AT+SAPBR=0,1', wait=2)
@@ -402,38 +452,66 @@ class SIM800:
 
     # ── HTTP ───────────────────────────────────────────────────────────────────
 
+    def http_get(self, url: str) -> int:
+        """GET url, returning the HTTP status code. Raises ModemLinkError if the modem never
+        reports a result. Cheap enough (no body) to use as a delivery check."""
+        self._send('AT+HTTPTERM', wait=1)
+        if 'OK' not in self._send('AT+HTTPINIT', wait=1):
+            raise ModemLinkError("HTTPINIT failed for GET")
+        for para in ('AT+HTTPPARA="CID",1', f'AT+HTTPPARA="URL","{url}"'):
+            if 'OK' not in self._send(para):
+                raise ModemLinkError(f"{para.split('=')[0]} rejected for GET")
+
+        self._send('AT+HTTPACTION=0', wait=0.5, heal=False)
+        # A bodyless GET returns far quicker than an upload, so it gets a tighter budget.
+        result = self._wait_for('+HTTPACTION:', timeout=max(30, self.action_timeout // 2))
+        time.sleep(0.5)
+        result += self._ser.read(self._ser.in_waiting or 0).decode('ascii', errors='ignore')
+        self._send('AT+HTTPTERM', wait=0.5)
+
+        if '+HTTPACTION:' in result:
+            try:
+                return int(result.split('+HTTPACTION:')[1].strip().split(',')[1])
+            except Exception:
+                pass
+        raise ModemLinkError("no +HTTPACTION result for confirmation GET")
+
     def http_post(self, url: str, body: bytes, content_type: str) -> int:
         """
         POST body to url using the modem's internal HTTP stack.
-        Returns the HTTP status code, or 0 on failure.
+        Returns the HTTP status code. Raises ModemLinkError if the modem or the link to it
+        failed, so the caller can tell "the server rejected this image" (park it) apart
+        from "we never got to ask" (keep it queued).
         """
         self._send('AT+HTTPTERM', wait=1)   # clean up any previous session
 
         resp = self._send('AT+HTTPINIT', wait=1)
-        if 'ERROR' in resp:
-            # HTTP stack stuck — full bearer cycle to reset it
-            logger.info("HTTPINIT failed, cycling bearer...")
+        if 'OK' not in resp:
+            # HTTP stack stuck (or already initialised) — full bearer cycle to reset it
+            logger.info(f"HTTPINIT did not confirm ({resp!r}), cycling bearer...")
             self.bearer_close()
             time.sleep(3)
-            self.bearer_open()
+            if not self.bearer_open():
+                raise ModemLinkError("bearer would not open")
             self._send('AT+HTTPTERM', wait=1)
             resp = self._send('AT+HTTPINIT', wait=2)
-        if 'ERROR' in resp:
-            logger.error("HTTPINIT failed after bearer reset")
-            return 0
+        if 'OK' not in resp:
+            raise ModemLinkError(f"HTTPINIT failed after bearer reset: {resp!r}")
 
-        self._send('AT+HTTPPARA="CID",1')
-        self._send(f'AT+HTTPPARA="URL","{url}"')
-        self._send(f'AT+HTTPPARA="CONTENT","{content_type}"')
+        for para in (f'AT+HTTPPARA="CID",1',
+                     f'AT+HTTPPARA="URL","{url}"',
+                     f'AT+HTTPPARA="CONTENT","{content_type}"'):
+            resp = self._send(para)
+            if 'OK' not in resp:
+                raise ModemLinkError(f"{para.split('=')[0]} rejected: {resp!r}")
 
         # Tell the modem how many bytes we'll send (give 60 s to receive them)
         resp = self._send(f'AT+HTTPDATA={len(body)},60000', wait=1)
         if 'DOWNLOAD' not in resp:
             resp += self._wait_for('DOWNLOAD', timeout=5)
         if 'DOWNLOAD' not in resp:
-            logger.error(f"Modem did not enter DOWNLOAD state: {resp}")
             self._send('AT+HTTPTERM')
-            return 0
+            raise ModemLinkError(f"modem did not enter DOWNLOAD state (got {resp!r})")
 
         # Write body in small chunks to avoid overwhelming the SIM800 receive buffer
         chunk_size = 512
@@ -443,25 +521,37 @@ class SIM800:
             time.sleep(0.02)
         self._wait_for('OK', timeout=10)
 
-        # Fire the POST — GPRS round-trips can take up to 2 minutes
-        self._send('AT+HTTPACTION=1', wait=0.5)
-        result = self._wait_for('+HTTPACTION:', timeout=180)
+        # Fire the POST — GPRS round-trips can take up to 2 minutes.
+        # heal=False: a re-sent HTTPACTION would POST the image a second time.
+        self._send('AT+HTTPACTION=1', wait=0.5, heal=False)
+        result = self._wait_for('+HTTPACTION:', timeout=self.action_timeout)
         # Read a bit more to capture the full line after the token arrives
         time.sleep(0.5)
         tail = self._ser.read(self._ser.in_waiting or 0)
         result += tail.decode('ascii', errors='ignore')
-        self._send('AT+HTTPTERM', wait=0.5)
 
         # Parse: +HTTPACTION: 1,<status_code>,<response_bytes>
         if '+HTTPACTION:' in result:
             try:
                 parts = result.split('+HTTPACTION:')[1].strip().split(',')
-                return int(parts[1])
+                status = int(parts[1])
+                self._send('AT+HTTPTERM', wait=0.5)
+                return status
             except Exception:
                 pass
 
-        logger.error(f"Could not parse HTTPACTION response: {result!r}")
-        return 0
+        # No result line. Record what the HTTP engine reports, for the log.
+        #
+        # +HTTPSTATUS: <mode>,<status>,<finish>,<remain>. Read it carefully: status 0 means
+        # *idle*, which an engine that already finished reports identically to one that never
+        # started. "POST,0,0,0" is therefore NOT evidence that the upload failed — during the
+        # original investigation it was misread that way, while the POSTs were in fact landing
+        # and being answered 200. Only the server can settle it, which is what
+        # Uploader._confirm_delivered() is for.
+        diag = self._send('AT+HTTPSTATUS?', wait=1)
+        self._send('AT+HTTPTERM', wait=0.5)
+        state = diag.splitlines()[0].strip() if diag else '+HTTPSTATUS unreadable'
+        raise ModemLinkError(f"no +HTTPACTION result after {self.action_timeout}s ({state})")
 
 
 class Uploader:
@@ -472,7 +562,12 @@ class Uploader:
         # one the server 500s on) never blocks the oldest-first queue behind it. Kept, not
         # deleted, so they can be re-sent once the server accepts them.
         self.failed_dir    = Path(config.get('failed_dir', '/failed'))
-        self.upload_url    = config.get('server_url', 'http://localhost:8000') + '/upload'
+        self.server_url    = config.get('server_url', 'http://localhost:8000').rstrip('/')
+        self.upload_url    = self.server_url + '/upload'
+        # Path used to ask the server whether an image already arrived, after a link fault
+        # swallowed the modem's reply. '{name}' is the name the server files it under.
+        # Set to "" in client.json to disable the check.
+        self.confirm_path  = config.get('confirm_path', '/annotate/specific/{name}')
         self.max_retries   = int(config.get('max_retries', 3))
         self.retry_delay   = int(config.get('retry_delay', 60))
         self.poll_interval = int(config.get('poll_interval', 10))
@@ -483,11 +578,17 @@ class Uploader:
 
         self.webp_compress = bool(config.get('webp_compress', False))
         self.webp_quality  = int(config.get('webp_quality', 80))
+        self._link_failures = 0   # consecutive cycles lost to a modem/link fault
+        # Images whose POST ended without a verdict. Checked against the server on the next
+        # cycle before being re-sent, so a delivered image is not uploaded twice.
+        self._unconfirmed = set()
 
         self.modem = SIM800(
             device=config.get('gsm_device', '/dev/serial0'),
             pin=config.get('gsm_pin', ''),
             apn=config.get('gsm_apn', 'web.vodafone.de'),
+            action_timeout=int(config.get('http_action_timeout', 60)),
+            baud=int(config.get('gsm_baud', 115200)),
         )
 
         self._sms_handler = SMSConfigHandler(
@@ -514,7 +615,8 @@ class Uploader:
 
     def _upload(self, file_path: Path, metadata: dict, attempt=0) -> str:
         """Attempt one upload. Returns 'ok' (sent), 'toobig' (won't fit even after adaptive
-        compression — don't retry), or 'retry' (transient/server failure, retry may help)."""
+        compression — don't retry), 'link' (modem/link fault: we never learned the server's
+        verdict, so keep the image queued), or 'retry' (server failure, retry may help)."""
         # Build the body first so the size check sees the actual POST payload the modem must
         # buffer — i.e. the WebP-compressed image, not the raw file. Give the image a byte budget
         # under the HTTP buffer (leaving margin for the multipart boundaries and metadata fields)
@@ -534,7 +636,12 @@ class Uploader:
             )
             return 'toobig'
 
-        status = self.modem.http_post(self.upload_url, body, content_type)
+        try:
+            status = self.modem.http_post(self.upload_url, body, content_type)
+        except ModemLinkError as e:
+            logger.error(f"Modem link fault, {file_path.name} stays queued: {e}")
+            return 'link'
+
         if status == 200:
             elapsed = time.time() - t0
             logger.info(f"Upload successful: {file_path.name} ({elapsed:.1f}s, {size / elapsed / 1024:.1f} KB/s)")
@@ -542,8 +649,8 @@ class Uploader:
 
         logger.warning(f"Upload failed (HTTP {status}): {file_path.name}")
 
-        # 0 = parse failure, 601/603 = SIM800 network error — re-open bearer
-        if status in (0, 601, 603):
+        # 601/603 = SIM800 network error — re-open bearer before the next attempt
+        if status in (601, 603):
             logger.info("Attempting to re-open GPRS bearer...")
             self.modem.bearer_open()
 
@@ -562,20 +669,42 @@ class Uploader:
             except Exception:
                 logger.warning(f"Could not read sidecar: {sidecar.name}")
 
+        # Pre-flight: if a previous attempt on this image ended without a verdict, settle it
+        # with a small GET before spending another ~120 KB of 2G on a POST the server may
+        # already have. Asking here rather than straight after the fault matters — by now
+        # _recover_link() has re-opened the port and rebuilt the bearer, so the check runs on
+        # a working link instead of the one that just stalled.
+        if oldest.name in self._unconfirmed:
+            if self._confirm_delivered(oldest):
+                self._unconfirmed.discard(oldest.name)
+                self._link_failures = 0
+                self._move_to_uploaded(oldest, sidecar)
+                return True
+
         for attempt in range(self.max_retries):
             result = self._upload(oldest, metadata, attempt)
+            if result != 'link':
+                # Anything other than a link fault means the modem carried the request and
+                # the server answered, so the transport is working again.
+                self._link_failures = 0
             if result == 'ok':
-                try:
-                    shutil.move(str(oldest), str(self.uploaded_dir / oldest.name))
-                    logger.info(f"Moved to uploaded: {oldest.name}")
-                    sidecar.unlink(missing_ok=True)
-                except Exception as e:
-                    logger.error(f"Error moving {oldest.name}: {e}")
+                self._move_to_uploaded(oldest, sidecar)
                 return True
             if result == 'toobig':
                 # Never fits — park it (kept for re-send) instead of wasting retries or, worse,
                 # dropping it into uploaded/ where it would look delivered.
                 self._park_failed(oldest, sidecar, "too large to send even after compression")
+                return False
+            if result == 'link':
+                # No verdict. Confirming right now would query the same link that just
+                # stalled, so record the doubt and let the next cycle's pre-flight check ask
+                # once the modem has been re-established.
+                #
+                # The image stays put: the transport is down, not this image. Parking it
+                # would empty the outbox into failed/ one image per cycle during any outage
+                # and make a network problem look like a pile of bad captures.
+                self._unconfirmed.add(oldest.name)
+                self._link_failures += 1
                 return False
             if attempt < self.max_retries - 1:
                 logger.info(f"Retrying in {self.retry_delay}s...")
@@ -586,9 +715,19 @@ class Uploader:
         self._park_failed(oldest, sidecar, f"failed after {self.max_retries} attempts")
         return False
 
+    def _move_to_uploaded(self, image: Path, sidecar: Path):
+        self._unconfirmed.discard(image.name)
+        try:
+            shutil.move(str(image), str(self.uploaded_dir / image.name))
+            logger.info(f"Moved to uploaded: {image.name}")
+            sidecar.unlink(missing_ok=True)
+        except Exception as e:
+            logger.error(f"Error moving {image.name}: {e}")
+
     def _park_failed(self, image: Path, sidecar: Path, reason: str):
         """Move an un-sendable image (and its sidecar) into failed/ — kept for later re-send,
         and out of the active queue so it never blocks the images behind it."""
+        self._unconfirmed.discard(image.name)
         logger.error(f"Parking {image.name} in {self.failed_dir.name}/ ({reason})")
         try:
             shutil.move(str(image), str(self.failed_dir / image.name))
@@ -619,6 +758,78 @@ class Uploader:
         except Exception as e:
             logger.warning(f"Could not save SIM number to config: {e}")
 
+    def _server_name(self, image: Path) -> str:
+        """The name the server files this image under. It re-encodes an uploaded WebP to
+        `<stem>.jpg` (splitting any thermal alpha into its own directory) and otherwise keeps
+        the name the file arrived with."""
+        return image.stem + '.jpg' if self.webp_compress else image.name
+
+    def _confirm_delivered(self, image: Path) -> bool:
+        """Ask the server whether the image already arrived.
+
+        A stalled USB read endpoint can swallow the modem's `+HTTPACTION:` line *after* the
+        POST has already been delivered and answered 200 — verified against the server's
+        request log. Without this check the uploader treats a delivered image as failed,
+        re-sends it every cycle (burning 2G data on duplicates the server just overwrites),
+        and never advances past it, so the whole queue stalls behind one image."""
+        if not self.confirm_path:
+            return False
+        url = self.server_url + self.confirm_path.format(name=self._server_name(image))
+        try:
+            status = self.modem.http_get(url)
+        except ModemLinkError as e:
+            logger.info(f"Delivery of {image.name} still unconfirmed ({e}) — staying queued")
+            return False
+        if status == 200:
+            logger.info(f"{image.name} is already on the server — the POST succeeded and "
+                        f"only the modem's reply was lost")
+            return True
+        logger.info(f"{image.name} not on the server yet (HTTP {status}) — will retry")
+        return False
+
+    def _recover_link(self):
+        """Escalating recovery after a modem/link fault, cheapest step first.
+
+        The image stays in the outbox throughout — this only rebuilds the transport. Steps
+        escalate because the cheap fixes cover the common faults: a stalled USB endpoint
+        needs only a port re-open, a stale PDP context needs a bearer rebuild, and a wedged
+        module needs a reset. If none of it helps, the fault is upstream of this Pi (no GPRS
+        data service) and the log should say so rather than churn silently."""
+        n = self._link_failures
+        logger.warning(f"Recovering modem link (consecutive link faults: {n})")
+
+        # Step 1, every time: clears a halted CP2102 read endpoint.
+        self.modem.reopen("recovering after a link fault")
+        if 'OK' not in self.modem._send('AT', wait=0.5):
+            logger.error("Modem not responding to AT after port re-open")
+
+        if n >= 2:
+            logger.info("Rebuilding the GPRS bearer from scratch...")
+            self.modem.bearer_close()
+            time.sleep(3)
+            # Bearer teardown can stall the endpoint too, so clear it before reopening.
+            self.modem.reopen("bearer teardown can stall the endpoint")
+            self.modem.bearer_open()
+
+        # Step 3, but only every 4th fault: a module reset costs ~45s of downtime, so it is
+        # worth retrying periodically without doing it on every single cycle.
+        if n >= 4 and n % 4 == 0:
+            logger.warning("Resetting the modem module (AT+CFUN=1,1)...")
+            self.modem._send('AT+CFUN=1,1', wait=2, heal=False)
+            time.sleep(30)
+            self.modem.reopen()
+            if self.modem.initialize():
+                self.modem.bearer_open()
+
+        if n >= 6 and n % 6 == 0:
+            logger.error(
+                "Modem still not reporting upload verdicts after repeated recovery. Note the "
+                "uploads may well be arriving — check the server before assuming otherwise. "
+                "The usual cause is the USB read endpoint halting: check "
+                "`dmesg | grep -c 'urb stopped'` and try a different USB port or cable "
+                "(see docs/gsm-hat-setup.md). Images remain queued."
+            )
+
     def _check_sms(self):
         try:
             messages = self.modem.read_pending_sms()
@@ -645,7 +856,10 @@ class Uploader:
             logger.info("Uploader running.")
             while True:
                 processed = self._process_oldest()
-                self._check_sms()
+                if self._link_failures:
+                    self._recover_link()
+                else:
+                    self._check_sms()
                 time.sleep(2 if processed else self.poll_interval)
 
         except KeyboardInterrupt:
