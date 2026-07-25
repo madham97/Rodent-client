@@ -7,6 +7,7 @@ Access at http://<pi-ip>:8080  (credentials in config/webui.env)
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from functools import wraps
@@ -21,6 +22,17 @@ LOG_PATH    = Path(os.environ.get('LOG_PATH',    '/var/log/monitoring-pipeline.l
 SERVICES = {
     'recorder': 'monitoring-pipeline-recorder',
     'uploader': 'monitoring-pipeline-uploader',
+}
+
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
+
+# The image queues the dashboard can read and act on, as name -> (config key, default).
+# Endpoints resolve directories only through this table, so a path can never come from the
+# request itself.
+QUEUE_DIRS = {
+    'outbox':   ('outbox_dir',   '/outbox'),
+    'uploaded': ('uploaded_dir', '/uploaded'),
+    'failed':   ('failed_dir',   '/failed'),
 }
 
 WEBUI_USERNAME = os.environ.get('WEBUI_USERNAME', 'admin')
@@ -85,9 +97,13 @@ def get_tailscale_ip():
         return None
 
 
+def queue_dir(config, which):
+    key, default = QUEUE_DIRS[which]
+    return Path(config.get(key, default))
+
+
 def dir_stats(path):
     """Return (file_count, total_bytes) for image files in path."""
-    IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
     try:
         files = [p for p in Path(path).iterdir()
                  if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
@@ -117,15 +133,16 @@ def api_status():
     signal      = get_gsm_signal()
     ts_ip       = get_tailscale_ip()
 
-    outbox_count, outbox_size     = dir_stats(config.get('outbox_dir',   '/outbox'))
-    uploaded_count, uploaded_size = dir_stats(config.get('uploaded_dir', '/uploaded'))
+    queues = {}
+    for which in QUEUE_DIRS:
+        count, size = dir_stats(queue_dir(config, which))
+        queues[which] = dict(count=count, size=fmt_bytes(size))
 
     return jsonify(
         services=services,
         gsm=dict(signal=signal, device=gsm_device, number=gsm_number),
-        outbox=dict(count=outbox_count, size=fmt_bytes(outbox_size)),
-        uploaded=dict(count=uploaded_count, size=fmt_bytes(uploaded_size)),
         ssh=dict(tailscale_ip=ts_ip),
+        **queues,
     )
 
 
@@ -162,18 +179,57 @@ def api_config_save():
         return jsonify(error=str(e)), 500
 
 
-@app.route('/api/outbox/clear', methods=['POST'])
+@app.route('/api/<which>/clear', methods=['POST'])
 @require_auth
-def api_outbox_clear():
+def api_clear(which):
+    """Delete every file in one of the image queues. Sidecars go with their image, but only
+    images are counted, so the number reported matches the count shown on the card."""
+    if which not in QUEUE_DIRS:
+        return jsonify(ok=False, error=f'unknown queue "{which}"'), 404
     try:
         config = json.loads(CONFIG_PATH.read_text())
-        outbox = Path(config.get('outbox_dir', '/outbox'))
         deleted = 0
-        for f in outbox.iterdir():
+        for f in queue_dir(config, which).iterdir():
             if f.is_file():
+                is_image = f.suffix.lower() in IMAGE_EXTS
                 f.unlink()
-                deleted += 1
+                deleted += is_image
         return jsonify(ok=True, deleted=deleted)
+    except FileNotFoundError:
+        return jsonify(ok=True, deleted=0)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.route('/api/failed/requeue', methods=['POST'])
+@require_auth
+def api_failed_requeue():
+    """Move everything in failed/ back to the outbox for another attempt.
+
+    Images land in failed/ for reasons that are often temporary from the image's point of
+    view — a server that was down, or a payload that could not be squeezed small enough at
+    the time — so re-queueing is the normal way to retry them once the cause is fixed. Each
+    image is moved with its sidecar, and modification times are preserved so the uploader's
+    oldest-first ordering still holds. An image whose name is already in the outbox is left
+    alone rather than overwriting the queued copy."""
+    try:
+        config = json.loads(CONFIG_PATH.read_text())
+        failed, outbox = queue_dir(config, 'failed'), queue_dir(config, 'outbox')
+        outbox.mkdir(parents=True, exist_ok=True)
+
+        moved = skipped = 0
+        for f in sorted(failed.iterdir()):
+            if not f.is_file():
+                continue
+            is_image = f.suffix.lower() in IMAGE_EXTS
+            if (outbox / f.name).exists():
+                skipped += is_image
+                continue
+            shutil.move(str(f), str(outbox / f.name))
+            moved += is_image
+        return jsonify(ok=True, moved=moved, skipped=skipped)
+    except FileNotFoundError:
+        return jsonify(ok=True, moved=0, skipped=0)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
 
@@ -253,20 +309,37 @@ HTML = r"""<!DOCTYPE html>
           <div id="gsm"><div class="placeholder-glow"><span class="placeholder col-6"></span></div></div>
         </div>
       </div>
-      <div class="col-sm-6">
-        <div class="card p-3">
+      <div class="col-sm-4">
+        <div class="card p-3 h-100">
           <div class="d-flex justify-content-between align-items-center mb-3">
             <h6 class="text-muted mb-0"><i class="bi bi-folder2-open"></i> Outbox</h6>
-            <button class="btn btn-outline-danger btn-sm" onclick="clearOutbox()"><i class="bi bi-trash"></i> Clear</button>
+            <button class="btn btn-outline-danger btn-sm" onclick="clearQueue('outbox', 'the outbox queue')"><i class="bi bi-trash"></i> Clear</button>
           </div>
           <div id="outbox"><div class="placeholder-glow"><span class="placeholder col-4"></span></div></div>
-          <div id="outbox-clear-res" class="small mt-2 d-none"></div>
+          <div id="outbox-res" class="small mt-2 d-none"></div>
         </div>
       </div>
-      <div class="col-sm-6">
-        <div class="card p-3">
-          <h6 class="text-muted mb-3"><i class="bi bi-check2-circle"></i> Uploaded</h6>
+      <div class="col-sm-4">
+        <div class="card p-3 h-100">
+          <div class="d-flex justify-content-between align-items-center mb-3">
+            <h6 class="text-muted mb-0"><i class="bi bi-check2-circle"></i> Uploaded</h6>
+            <button class="btn btn-outline-danger btn-sm" onclick="clearQueue('uploaded', 'the uploaded archive')"><i class="bi bi-trash"></i> Clear</button>
+          </div>
           <div id="uploaded"><div class="placeholder-glow"><span class="placeholder col-4"></span></div></div>
+          <div id="uploaded-res" class="small mt-2 d-none"></div>
+        </div>
+      </div>
+      <div class="col-sm-4">
+        <div class="card p-3 h-100">
+          <div class="d-flex justify-content-between align-items-center mb-3">
+            <h6 class="text-muted mb-0"><i class="bi bi-exclamation-triangle"></i> Failed</h6>
+            <div class="btn-group">
+              <button class="btn btn-outline-primary btn-sm" onclick="requeueFailed()" title="Move these images back to the outbox to try uploading them again"><i class="bi bi-arrow-counterclockwise"></i> Requeue</button>
+              <button class="btn btn-outline-danger btn-sm" onclick="clearQueue('failed', 'the failed images')"><i class="bi bi-trash"></i> Clear</button>
+            </div>
+          </div>
+          <div id="failed"><div class="placeholder-glow"><span class="placeholder col-4"></span></div></div>
+          <div id="failed-res" class="small mt-2 d-none"></div>
         </div>
       </div>
       <div class="col-12">
@@ -483,15 +556,13 @@ function fetchStatus() {
        <div class="text-muted small mt-1">Device: <code>${d.gsm.device}</code></div>` +
       (d.gsm.number ? `<div class="text-muted small">SIM number: <code>${d.gsm.number}</code></div>` : '');
 
-    document.getElementById('outbox').innerHTML =
-      `<span class="fs-3 fw-bold">${d.outbox.count}</span>
-       <span class="text-muted ms-1">files</span>
-       <div class="text-muted small">${d.outbox.size}</div>`;
-
-    document.getElementById('uploaded').innerHTML =
-      `<span class="fs-3 fw-bold">${d.uploaded.count}</span>
-       <span class="text-muted ms-1">files</span>
-       <div class="text-muted small">${d.uploaded.size}</div>`;
+    for (const q of ['outbox', 'uploaded', 'failed']) {
+      const muted = d[q].count === 0 ? ' text-muted' : (q === 'failed' ? ' text-danger' : '');
+      document.getElementById(q).innerHTML =
+        `<span class="fs-3 fw-bold${muted}">${d[q].count}</span>
+         <span class="text-muted ms-1">images</span>
+         <div class="text-muted small">${d[q].size}</div>`;
+    }
 
     // SSH / remote access
     const ip = d.ssh && d.ssh.tailscale_ip;
@@ -578,22 +649,35 @@ function doService(action) {
     });
 }
 
-function clearOutbox() {
-  if (!confirm('Delete all files in the outbox queue?')) return;
-  const el = document.getElementById('outbox-clear-res');
+// Run a queue action and report the outcome under the card it belongs to.
+function queueAction(which, url, busyText, describe) {
+  const el = document.getElementById(which + '-res');
   el.className = 'small mt-2 text-muted';
-  el.textContent = 'Clearing…';
+  el.textContent = busyText;
   el.classList.remove('d-none');
-  fetch('/api/outbox/clear', {method: 'POST'})
+  fetch(url, {method: 'POST'})
     .then(r => r.json())
     .then(d => {
       el.className = 'small mt-2 ' + (d.ok ? 'text-success' : 'text-danger');
-      el.textContent = d.ok ? `✓ Deleted ${d.deleted} file(s)` : '✗ ' + (d.error || 'failed');
+      el.textContent = d.ok ? '✓ ' + describe(d) : '✗ ' + (d.error || 'failed');
       setTimeout(fetchStatus, 1000);
     }).catch(e => {
       el.className = 'small mt-2 text-danger';
       el.textContent = '✗ ' + e.message;
     });
+}
+
+function clearQueue(which, label) {
+  if (!confirm(`Delete all images in ${label}? This cannot be undone.`)) return;
+  queueAction(which, `/api/${which}/clear`, 'Clearing…',
+              d => `Deleted ${d.deleted} image(s)`);
+}
+
+function requeueFailed() {
+  if (!confirm('Move all failed images back to the outbox and try uploading them again?')) return;
+  queueAction('failed', '/api/failed/requeue', 'Moving…',
+              d => `Moved ${d.moved} image(s) to the outbox` +
+                   (d.skipped ? `, skipped ${d.skipped} already queued` : ''));
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────

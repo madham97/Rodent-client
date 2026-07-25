@@ -116,7 +116,8 @@ The modem class is named `SIM800` but works with SIM868/SIM800C as well (same AT
 
 Flask app on port 8080, protected by HTTP Basic Auth (credentials from `config/webui.env`). Provides:
 
-- **Dashboard** — service status (recorder/uploader active/inactive), last known GSM signal strength (read from log — avoids serial port contention), outbox/uploaded file counts and sizes, Tailscale SSH address
+- **Dashboard** — service status (recorder/uploader active/inactive), last known GSM signal strength (read from log — avoids serial port contention), image counts and sizes for the outbox, uploaded and failed queues, Tailscale SSH address
+- **Queue actions** — each queue has a *Clear*; the failed queue also has a *Requeue* that moves its images (with sidecars) back to the outbox for another attempt, which is how images parked during an outage are retried. Requeue never overwrites an image already queued under the same name. Endpoints resolve directories only through a fixed name→config-key table, so a path can never be supplied by the request
 - **Logs** — live tail of `/var/log/monitoring-pipeline.log`
 - **Config** — in-browser editor for `client.json`; saves and optionally restarts affected services
 

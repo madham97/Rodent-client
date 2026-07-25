@@ -184,7 +184,7 @@ Messages from any phone number are accepted. The reply is sent back to the sende
 
 Accessible at `http://<tailscale-ip>:8080` (or local IP) with the credentials from `webui.env`.
 
-- **Dashboard** — service status, GSM signal strength, outbox/uploaded file counts, Tailscale SSH address
+- **Dashboard** — service status, GSM signal strength, image counts for the outbox, uploaded and failed queues, Tailscale SSH address. Each queue has a **Clear**; the failed queue also has a **Requeue** that moves its images back to the outbox to be uploaded again — the normal way to retry images parked during an outage, once the cause is fixed
 - **Logs** — live tail of `/var/log/monitoring-pipeline.log`
 - **Config** — edit and save `client.json` in-browser
 
