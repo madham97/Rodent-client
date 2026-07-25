@@ -20,7 +20,7 @@ The installer will prompt for:
 | GSM APN | `web.vodafone.de` | Data APN for your SIM card |
 | GSM serial device | `/dev/serial0` | GPIO UART. Use `/dev/ttyUSB0` for USB mode — see `docs/gsm-hat-setup.md` |
 | SIM PIN | *(blank)* | Entered silently with confirmation. Stored in `client.json` (mode 640) |
-| Recording mode | `image_motion` | `1` = JPEG on motion, `2` = JPEG on a timer |
+| Recording mode | `image_motion` | `1` = capture on motion, `2` = capture on a timer (PNG when thermal fusion is on, JPEG otherwise) |
 | Web UI password | `monitoring` | Password for the dashboard at port 8080 |
 | Start services now | yes | Enables and starts all systemd services |
 
@@ -36,13 +36,31 @@ Re-running `install.sh` is safe — it loads existing values as defaults.
 ## How it works
 
 ```
-rpicam-still → /outbox/image_YYYYMMDDThhmmssZ.jpg
-                          + .json sidecar (device_id, mode, timestamp, motion_score)
+picamera2 stream (continuous, 1.5s pre-trigger ring buffer)
+  + MI48 thermal stream (continuous)
+                    ↓
+      motion seen at time T → both buffers queried for the
+      best-synchronised pair of frames captured at T
+                    ↓
+   /outbox/image_YYYYMMDDThhmmssZ.png   (RGBA: visible + thermal in alpha)
+             + .json sidecar (device_id, mode, timestamp, motion_score,
+                              thermal_min_c/max_c/avg_c, thermal_skew_ms)
                     ↓
               uploader reads oldest image + sidecar
+              → re-encodes to WebP (alpha preserved) to fit the modem's 300KB limit
               → multipart POST to server /upload
               → moves image to /uploaded, deletes sidecar
 ```
+
+Both cameras stream continuously and captures are served from their buffers, rather than a
+capture being triggered on demand. This is what makes the two frames simultaneous *and* makes
+the triggered frame the one from the moment motion occurred: a fresh `rpicam-still` process
+spends ~1s initialising the camera before it exposes, so an on-demand capture shows the scene
+1.5–3s after the animal moved. The filename timestamp is the frame's **exposure** time, not the
+time it was written.
+
+Captures with no properly-timed thermal counterpart are **discarded**, not saved unpaired — see
+`thermal_max_skew_s` under [Thermal Camera](#thermal-camera).
 
 ## Services
 
@@ -97,8 +115,13 @@ Key settings:
 - `recording.motion_threshold` — fraction of pixels that must change to trigger (0–1, default 0.015)
 - `recording.motion_cooldown` — seconds to wait after a capture before checking for motion again
 - `recording.image_interval` — seconds between captures in interval mode
+- `recording.capture_backend` — `picamera2` (default) streams the camera continuously with a pre-trigger buffer; `rpicam` runs a fresh `rpicam-still` per capture, costing ~1s of camera init before every exposure. Falls back to `rpicam` automatically if picamera2 can't start
+- `recording.camera_fps` — stream frame rate for the `picamera2` backend (default 15)
+- `recording.camera_buffer_s` — seconds of full-res frames kept in the pre-trigger buffer (default 1.5, ~3MB per frame). Must be longer than the delay between motion onset and detection firing, or the onset frame is already gone
 - `recording.image_quality` — JPEG quality 1–100 (default 75)
 - `recording.image_rotation` — software rotation in degrees clockwise (`0`/`90`/`180`/`270`) to correct how the CSI camera is physically mounted. `rpicam-still` only supports 0/180 in hardware, so 90/270 mounts need this. Unlike `--hflip`/`--vflip`, a rotation preserves left/right handedness — important once this feed is paired with the thermal feed (see [Thermal Camera](#thermal-camera))
+- `recording.detection_interval` — seconds between motion checks. On the `picamera2` backend a check costs ~0.06s instead of ~0.6s, so this can be much shorter than it used to be; keep it below `camera_buffer_s`
+- `recording.baseline_frames` — frames averaged into the motion baseline (default 3). Rebuilt after every trigger, and the recorder is blind while it happens
 - `recording.width` / `recording.height` — capture resolution (default 1280×720)
 - `recording.motion_debug` — set `true` to log the motion ratio on every check, useful for tuning `motion_threshold`
 - `recording.thermal_enabled` — fuse the GPIO thermal camera into every capture (default `false`, see [Thermal Camera](#thermal-camera))
@@ -108,6 +131,8 @@ Key settings:
 - `recording.thermal_hflip` / `recording.thermal_vflip` — flip the thermal frame so it agrees with the visible frame's left/right and up/down. The MI48's readout orientation is independent of the CSI camera's, so this needs to be set from an actual test (see [Thermal Camera](#thermal-camera)), not assumed
 
 Restart the relevant service after any change:
+- `recording.thermal_max_skew_s` — maximum time gap allowed between the visible exposure and the thermal frame fused with it; captures that can't be paired this closely are **discarded**. Defaults to `0.75 / thermal_fps` (83ms at 9fps). The floor is half a thermal frame interval (56ms at 9fps) — raise `thermal_fps` to tighten it (see [Thermal Camera](#thermal-camera))
+- `recording.thermal_stall_warn_s` / `recording.camera_stall_warn_s` — log a warning if either stream produces no frames for this long (default 5.0 each)
 ```bash
 sudo systemctl restart monitoring-pipeline-recorder  # after recording changes
 sudo systemctl restart monitoring-pipeline-uploader  # after upload/GSM changes
@@ -188,23 +213,27 @@ An optional Waveshare MI48 80×62 thermal camera can be attached via GPIO (I2C +
 
 **Combined feed (recorder integration)**
 
-Set `recording.thermal_enabled: true` in `client.json` and restart the recorder service. The MI48 sensor then streams continuously in a background thread inside `recorder.py`; every visible-camera capture (motion or interval) is fused with whatever thermal frame is currently buffered:
+Set `recording.thermal_enabled: true` in `client.json` and restart the recorder service. Both the MI48 thermal sensor and the visible camera then stream continuously in background threads inside `recorder.py`, each buffering recent frames. A capture picks the best-synchronised **pair** from the two buffers — considering every visible frame near the moment of interest and choosing the one that sits closest to a thermal frame, rather than taking one frame and accepting whatever thermal frame is newest:
 
 - Output changes from `image_*.jpg` to `image_*.png` — an RGBA image where R/G/B is the visible frame and **the normalized thermal frame is stored as the alpha channel**.
 - The sidecar JSON gets `format: "rgba_thermal_alpha"` plus `thermal_min_c` / `thermal_max_c` / `thermal_avg_c` — the actual °C range the alpha byte was normalized from, needed to reconstruct real temperatures server-side: `temp_c = thermal_min_c + (alpha / 255) * (thermal_max_c - thermal_min_c)`.
-- If the sensor fails to init or hasn't produced a frame yet, capture falls back to a plain JPEG (`format: "rgb"`) rather than blocking — a thermal hiccup never stops the visible-camera pipeline.
+- The sidecar also carries `thermal_skew_ms` — the signed time gap between the two fused frames (+ = thermal newer). Sync is therefore auditable from the uploaded data alone; filter on it server-side if a study needs tighter simultaneity than the recorder enforced.
+- **Captures that can't be paired within `thermal_max_skew_s` are discarded, not saved unpaired.** For a moving subject a mistimed pair is wrong data rather than degraded data, so no image and no sidecar is written and nothing is uploaded. Each drop is logged with a running count (`Discarded unsynced capture ... N dropped so far`) — watch that count in the field, since a persistent thermal fault shows up as silence in the outbox rather than an error.
+- Expect a few dropped captures at startup while the thermal sensor warms up. That is normal.
 - The uploader's WebP compression (`webp_compress`) applies to fused PNGs too and preserves the alpha channel, keeping combined captures well under the SIM800's 300KB upload limit.
 
 **Aligning the two feeds (rotation and mirroring)**
 
 The CSI ribbon camera and the GPIO thermal sensor are independent hardware with independent, arbitrary mounting/readout orientations — there's no default that's correct for every unit. Two separate corrections may be needed, and they're not interchangeable:
 
-- **`recording.image_rotation`** (0/90/180/270, applies to the visible feed) — corrects the CSI camera's physical mounting angle. `rpicam-still` only supports 0/180 in hardware, so 90/270 mounts need this software rotation. A rotation *preserves* left/right handedness.
+- **`recording.image_rotation`** (0/90/180/270, applies to the visible feed) — corrects the CSI camera's physical mounting angle, in software, on both capture backends. A rotation *preserves* left/right handedness.
 - **`recording.thermal_hflip`** / **`thermal_vflip`** (applies to the thermal feed) — corrects the MI48's readout orientation, which is independent of the camera's mounting. A flip *reverses* left/right handedness — that's a fundamentally different kind of correction than a rotation, and one doesn't substitute for the other.
 
 Figure out both empirically, don't guess:
 1. Set `image_rotation` first: capture a frame and check the visible image is upright. Test all 4 values if needed.
 2. Once the visible frame is upright, run `record_combined.py` and raise **one specific hand** (note which). Check the RGB pane: for a camera facing you (not a mirror/selfie view), your right hand should appear on the image's *left* side — that's the correct, unmirrored convention for a monitoring camera. If it's backwards, that means the visible feed itself needs a hardware/software hflip too (not covered by `image_rotation`).
+**How close is "simultaneous"?** The limit is the thermal sensor's frame rate: at `thermal_fps: 9` frames are 111ms apart, so nearest-neighbour pairing can only ever land within half an interval (~56ms) — there is no thermal data in between to pair with. Measured on real captures: typically ±10–60ms. Raising `thermal_fps` tightens this (25fps → ~20ms floor) but stresses the SPI link; see CRC errors below.
+
 3. Compare the thermal pane to the now-correct RGB pane in the same frame: does the warm blob (your raised hand) line up on the same side as the RGB hand? If not, toggle `thermal_hflip` (or `thermal_vflip` if it's an up/down mismatch instead) and re-test until they agree.
 
 **CRC errors / dropped thermal frames**
@@ -252,3 +281,6 @@ Full wiring, config, and installation instructions: [`docs/thermal-camera-setup.
 | Motion not triggering | Lower `motion_threshold` or enable `motion_debug` to see live ratios |
 | Dashboard not accessible | Check webui service is running; confirm Tailscale is authenticated |
 | SMS commands not working | Confirm modem is registered (`AT+CREG?`); check uploader log for `SMS from` lines; ensure SIM can receive SMS |
+| Nothing appearing in `/outbox` with thermal on | Look for `Discarded unsynced capture` in the log — captures are dropped when visible and thermal frames can't be paired within `thermal_max_skew_s`. A stalled sensor (`Thermal stream stalled`) silences the outbox rather than erroring |
+| Log shows `Falling back to rpicam-still capture` | picamera2 failed to start, so the recorder is running the slow per-capture path (~1s camera init before every exposure, no pre-trigger buffer). See the numpy/simplejpeg note below |
+| `picamera2` import fails with `numpy.dtype size changed` | Debian's `python3-simplejpeg` is compiled against the numpy 1.x ABI, but numpy 2.x is installed in `/usr/local/lib/python3.11/dist-packages` and shadows Debian's. Do **not** downgrade numpy — opencv and the thermal code need 2.x. Instead install a numpy-2-compatible simplejpeg into the venv, where it shadows the system package: `sudo venv/bin/pip install --upgrade --force-reinstall --only-binary :all: simplejpeg`. Re-check with `venv/bin/python3 -c "import picamera2"`. This is worth re-testing after any rebuild of the venv or system packages |

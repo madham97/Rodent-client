@@ -348,11 +348,15 @@ HTML = r"""<!DOCTYPE html>
             <p class="fw-semibold mb-1 text-uppercase" style="font-size:0.7rem;letter-spacing:.05em">Recording</p>
             <table class="table table-sm table-borderless mb-3" style="font-size:0.82rem">
               <tbody>
-                <tr><td class="text-nowrap pe-2"><code>mode</code></td><td class="text-muted"><code>image_motion</code> JPEG on movement · <code>image_interval</code> JPEG every N seconds</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>camera_id</code></td><td class="text-muted">Camera index (0 = default)</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>mode</code></td><td class="text-muted"><code>image_motion</code> capture on movement · <code>image_interval</code> capture every N seconds. Output is a fused RGBA PNG when thermal fusion is on, a JPEG when it's off</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>camera_id</code></td><td class="text-muted">Camera index (0 = default) — only used by the <code>rpicam</code> backend</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>width</code> / <code>height</code></td><td class="text-muted">Capture resolution in pixels</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>min_size_bytes</code></td><td class="text-muted">Minimum file size to treat an image as valid</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>rpicam_still_path</code></td><td class="text-muted">Path to rpicam-still binary</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>min_size_bytes</code></td><td class="text-muted">Minimum file size to treat an image as valid — only used by the <code>rpicam</code> backend</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>capture_backend</code></td><td class="text-muted"><code>picamera2</code> (default) keeps the camera streaming with a pre-trigger buffer, so a triggered capture is served from the instant motion was seen · <code>rpicam</code> runs a fresh rpicam-still per capture, which costs ~1s of camera init before every exposure. Falls back to <code>rpicam</code> automatically if picamera2 can't start</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>camera_fps</code></td><td class="text-muted">Stream frame rate for the <code>picamera2</code> backend (default 15). Higher = finer choice of frame to pair with thermal, more CPU and memory</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>camera_buffer_s</code></td><td class="text-muted">Seconds of full-res frames held in the pre-trigger buffer (default 1.5). Must exceed how long after motion onset detection fires, or the onset frame is gone. ~3MB per frame, so 1.5s at 15fps ≈ 68MB</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>camera_stall_warn_s</code></td><td class="text-muted">Log a warning if the camera stream produces no frames for this long (default 5.0)</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>rpicam_still_path</code></td><td class="text-muted">Path to rpicam-still binary — only used by the <code>rpicam</code> backend</td></tr>
               </tbody>
             </table>
 
@@ -360,12 +364,12 @@ HTML = r"""<!DOCTYPE html>
             <table class="table table-sm table-borderless" style="font-size:0.82rem">
               <tbody>
                 <tr><td class="text-nowrap pe-2"><code>motion_threshold</code></td><td class="text-muted">Fraction of pixels that must change to trigger (0–1, default 0.02)</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>detection_interval</code></td><td class="text-muted">Seconds between motion checks</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>detection_width</code> / <code>detection_height</code></td><td class="text-muted">Resolution of detection frames — low-res for speed</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>detection_interval</code></td><td class="text-muted">Seconds between motion checks. On the <code>picamera2</code> backend a check costs ~0.06s (the frame is already buffered) rather than ~0.6s, so this can be much shorter than it used to be — but lowering it changes sensitivity, since less of the scene changes between closer-spaced frames. Keep it below <code>camera_buffer_s</code></td></tr>
+                <tr><td class="text-nowrap pe-2"><code>detection_width</code> / <code>detection_height</code></td><td class="text-muted">Resolution of detection frames — low-res for speed. On the <code>picamera2</code> backend this is the size of the lores stream</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>baseline_frames</code></td><td class="text-muted">Frames averaged into the motion baseline (default 3). Rebuilt after every trigger and the recorder is blind while it happens, so this trades shake-suppression against missed motion</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>temporal_alpha</code></td><td class="text-muted">How fast background average updates (0–1). Lower = more shake-resistant, higher = reacts faster</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>motion_cooldown</code></td><td class="text-muted">Seconds to wait after a motion capture before checking again (0 = no cooldown)</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>motion_debug</code></td><td class="text-muted">Log motion ratio on every detection check — useful for tuning motion_threshold (true/false)</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>rpicam_still_path</code></td><td class="text-muted">Path to rpicam-still binary (used for motion detection and image modes)</td></tr>
               </tbody>
             </table>
 
@@ -393,6 +397,8 @@ HTML = r"""<!DOCTYPE html>
             </table>
 
           </div>
+                <tr><td class="text-nowrap pe-2"><code>thermal_max_skew_s</code></td><td class="text-muted">Maximum time gap allowed between the visible exposure and the thermal frame fused with it. A capture that can't be paired this closely is <strong>discarded</strong>, not saved unpaired — a mistimed pair is wrong data, not degraded data, once the subject moves. Defaults to <code>0.75 / thermal_fps</code> (83ms at 9fps). The floor is half a thermal frame interval (56ms at 9fps), since no thermal data exists between frames — asking for less just discards captures. Raise <code>thermal_fps</code> to tighten it</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_stall_warn_s</code></td><td class="text-muted">Log a warning if the thermal sensor produces no frames for this long (default 5.0). Without this a stalled sensor is invisible — the last good frame would otherwise keep being fused into fresh captures</td></tr>
         </div>
       </div>
     </div>
