@@ -9,10 +9,15 @@ A Raspberry Pi-based surveillance client that captures images (on motion or on a
 ```
 Rodent-client/
 ├── pi-client/
-│   ├── recorder.py          # Image capture service
+│   ├── recorder.py          # Image capture service (visible + thermal fusion)
 │   ├── uploader.py          # GSM upload service
 │   ├── web_ui.py            # Flask management dashboard
+│   ├── thermal/             # MI48 thermal sensor: streaming, snapshot, combined recording
 │   └── test_record_upload.py
+├── data/                    # Runtime image queue (gitignored)
+│   ├── outbox/              # Captured, awaiting upload
+│   ├── uploaded/            # Confirmed delivered
+│   └── failed/              # Un-sendable or server-rejected; kept for a later re-send
 ├── scripts/
 │   └── gsm-pin-unlock.py    # One-shot SIM PIN unlock at boot
 ├── systemd/                 # Service unit files (copied to /etc/systemd/system/)
@@ -43,26 +48,30 @@ The `gsm` and `gsm-pin` services are legacy from when pppd was used for data. Th
 ## Data Flow
 
 ```
-rpicam-still
+picamera2 (or rpicam-still) [+ MI48 thermal]
     │
     ▼
-/outbox/image_YYYYMMDDTHHMMSSz.jpg   ← written atomically (sidecar then rename)
-/outbox/image_YYYYMMDDTHHMMSSz.json  ← sidecar: device_id, mode, timestamp, motion_score
+data/outbox/image_YYYYMMDDTHHMMSSz.png   ← RGBA fused frame (thermal in alpha); .jpg when
+                                            thermal fusion is off. Written atomically.
+data/outbox/image_YYYYMMDDTHHMMSSz.json  ← sidecar: device_id, mode, timestamp, motion_score,
+                                            and when fused: format, thermal_min/max/avg_c
     │
     ▼ uploader polls outbox (oldest-first)
     │
-    ├─ optionally re-encodes JPEG → WebP (reduces transfer size)
+    ├─ re-encodes to WebP, adaptively lowering quality/scale to fit the modem's buffer
     │
     ▼
 multipart/form-data POST → server /upload  (via SIM800 AT+HTTP stack)
     │
-    ▼
-/uploaded/image_YYYYMMDDTHHMMSSz.jpg  ← moved on success, sidecar deleted
+    ├─ HTTP 200 ──────────────► data/uploaded/   (sidecar deleted)
+    ├─ modem/link fault ──────► stays in outbox, delivery confirmed against the server
+    │                           on the next cycle before any re-send
+    └─ server error / too big ► data/failed/     (kept for a later re-send)
 ```
 
-Images are written atomically: the sidecar `.json` is always written before the `.jpg` is renamed into place, so the uploader never sees a `.jpg` without its metadata.
+Images are written atomically: the sidecar `.json` is always written before the image is renamed into place, so the uploader never sees an image without its metadata.
 
-Files larger than 300 KB are skipped (SIM800 internal HTTP buffer limit) and moved directly to `/uploaded` with a log warning.
+An image whose payload cannot be squeezed under the modem's HTTP buffer even after adaptive compression is parked in `data/failed/` — never dropped into `uploaded/`, which would make it look delivered.
 
 ## Key Components
 
@@ -81,9 +90,23 @@ Manages the full GSM upload pipeline:
 
 1. Opens the serial port to the modem (`/dev/ttyUSB0` for USB mode, `/dev/serial0` for GPIO mode)
 2. Initialises the modem: polls `AT` until ready, resets with `ATZ`, unlocks SIM PIN if configured, waits for network registration (`AT+CREG`)
-3. Opens a GPRS bearer (`AT+SAPBR`) with the configured APN
-4. Polls `/outbox` for the oldest image, builds a multipart body, sends it via `AT+HTTP`
+3. Opens a GPRS bearer (`AT+SAPBR`) with the configured APN, verifying the result with `AT+SAPBR=2,1` rather than trusting the reply
+4. Polls the outbox for the oldest image, builds a multipart body, sends it via `AT+HTTP`
 5. Between uploads, checks for incoming SMS messages — operators can update config or query status remotely via SMS commands (`SET key=value`, `STATUS`)
+
+**Failure handling.** The uploader distinguishes three outcomes, because they need opposite responses:
+
+| Outcome | Meaning | Response |
+|---------|---------|----------|
+| HTTP status returned | The server saw the image and judged it | 200 → `uploaded/`; other codes → retry, then park in `failed/` |
+| `ModemLinkError` | The modem never reported a verdict — we don't know what happened | Keep the image queued, escalate link recovery, confirm delivery next cycle |
+| `toobig` | Won't fit even after adaptive compression | Park in `failed/` immediately |
+
+A link fault must never be treated as a bad image: doing so drains the outbox into `failed/` one image per cycle during any outage, and makes a transport problem look like a pile of bad captures.
+
+**Recovering a one-way serial link.** A GPRS data attempt can halt the CP2102's USB bulk-IN endpoint, after which the port accepts writes but never delivers another byte — every AT command appears to return an empty response forever. The uploader detects the empty response, re-opens the port (the only thing that clears it), and retries once. Commands that must not be duplicated (`AT+HTTPACTION`, SMS send) opt out via `heal=False`. See `docs/gsm-hat-setup.md` for the full diagnosis; the root cause was a faulty USB port.
+
+**Delivery confirmation.** If a stall swallows the modem's `+HTTPACTION` line, the POST may already have been delivered and answered 200. Before re-sending, the uploader asks the server whether the image is already there (`confirm_path`, a small bodyless GET). This runs at the *start* of the next cycle — after link recovery, on a working link — rather than immediately after the fault on the link that just failed.
 
 The modem class is named `SIM800` but works with SIM868/SIM800C as well (same AT command set).
 
@@ -119,16 +142,20 @@ Keys settable via SMS: `motion_threshold`, `motion_cooldown`, `detection_interva
 ```json
 {
   "server_url":    "http://...",
-  "device_id":     "rodent2",
-  "outbox_dir":    "/outbox",
-  "uploaded_dir":  "/uploaded",
+  "device_id":     "rodent",
+  "outbox_dir":    "/opt/Rodent-client/data/outbox",
+  "uploaded_dir":  "/opt/Rodent-client/data/uploaded",
+  "failed_dir":    "/opt/Rodent-client/data/failed",
   "gsm_device":    "/dev/ttyUSB0",
+  "gsm_baud":      115200,
   "gsm_pin":       "...",
   "gsm_apn":       "...",
   "gsm_number":    "+...",
   "poll_interval": 10,
   "max_retries":   3,
   "retry_delay":   10,
+  "http_action_timeout": 60,
+  "confirm_path":  "/annotate/specific/{name}",
   "webp_compress": true,
   "webp_quality":  80,
   "recording": {
@@ -165,6 +192,8 @@ Keys settable via SMS: `motion_threshold`, `motion_cooldown`, `detection_interva
 
 - **SIM800 HTTP buffer**: Max upload size is ~300 KB. WebP compression is recommended to stay under this limit for 1280×720 captures.
 - **Serial port exclusivity**: Only one process should hold the serial port open at a time. The web_ui reads signal strength from the log file rather than the modem for this reason.
+- **USB endpoint stalls are a physical fault, not a software one**: if the log shows repeated `Modem link fault ... (+HTTPSTATUS: POST,0,0,0)` while the modem is otherwise healthy (registered, bearer up, `AT+CBC` ~4000 mV), check `dmesg | grep -c 'urb stopped'` — two new lines per data attempt means the USB read endpoint is halting. Work the physical layer: a different USB port, straight into the Pi rather than through a hub, a different cable. This was diagnosed at length once already; `docs/gsm-hat-setup.md` records what was tested and ruled out so it need not be repeated.
+- **GPIO UART is not an available fallback on this unit**: the thermal camera occupies the GPIO header, so the USB path is the only option.
 - **USB device naming**: `/dev/ttyUSB0` is assigned at boot and should be stable, but if multiple USB serial devices are present the number can change. Check with `ls /dev/ttyUSB*` if the modem stops responding after adding hardware.
 - **2G only**: The SIM868/SIM800C is a 2G module. Requires a SIM card and carrier that still supports 2G (GPRS). Not compatible with 3G/4G-only carriers.
 - **GPIO UART vs USB**: See `docs/gsm-hat-setup.md` for the full history and configuration differences.

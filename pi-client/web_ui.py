@@ -326,13 +326,16 @@ HTML = r"""<!DOCTYPE html>
             <table class="table table-sm table-borderless mb-3" style="font-size:0.82rem">
               <tbody>
                 <tr><td class="text-nowrap pe-2"><code>server_url</code></td><td class="text-muted">Remote server to upload images to</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>webp_compress</code></td><td class="text-muted">Re-encode JPEGs as WebP before upload for smaller transfer (true/false). Original JPEG kept on disk.</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>webp_quality</code></td><td class="text-muted">WebP encode quality for upload (1–100, default 80)</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>webp_compress</code></td><td class="text-muted">Re-encode captures as WebP before upload for smaller transfer (true/false). Alpha survives, so thermal-fused frames keep their thermal channel. Original file kept on disk.</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>webp_quality</code></td><td class="text-muted">WebP encode quality for upload (1–100, default 80). Lowered automatically, then scaled down, if a frame would otherwise exceed the modem's HTTP buffer</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>outbox_dir</code></td><td class="text-muted">Images wait here before upload</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>uploaded_dir</code></td><td class="text-muted">Images moved here after successful upload</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>max_retries</code></td><td class="text-muted">Upload attempts before giving up on a file</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>failed_dir</code></td><td class="text-muted">Images the server rejected, or that cannot be compressed small enough, are parked here — kept for a later re-send and out of the queue so they cannot block the images behind them. A modem or link fault does <em>not</em> park an image; it stays queued</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>max_retries</code></td><td class="text-muted">Upload attempts before parking a file in <code>failed_dir</code></td></tr>
                 <tr><td class="text-nowrap pe-2"><code>retry_delay</code></td><td class="text-muted">Seconds between upload retries</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>poll_interval</code></td><td class="text-muted">Seconds between checks for new images</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>http_action_timeout</code></td><td class="text-muted">Seconds to wait for the modem's upload verdict (default 60). Real 2G round-trips are 26–37s; waiting longer does not recover a verdict lost to a USB stall, it only slows the queue</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>confirm_path</code></td><td class="text-muted">Server path used to check whether an image already arrived, when the modem's reply was lost. Stops a delivered image being uploaded again. Set to empty to disable</td></tr>
               </tbody>
             </table>
 
@@ -340,6 +343,7 @@ HTML = r"""<!DOCTYPE html>
             <table class="table table-sm table-borderless mb-3" style="font-size:0.82rem">
               <tbody>
                 <tr><td class="text-nowrap pe-2"><code>gsm_device</code></td><td class="text-muted">Serial port for the GSM modem</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>gsm_baud</code></td><td class="text-muted">Modem serial speed (default 115200). Must match the modem's <code>AT+IPR</code> setting</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>gsm_pin</code></td><td class="text-muted">SIM PIN — omit if not required</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>gsm_number</code></td><td class="text-muted">Phone number of the SIM — for reference when sending SMS config commands</td></tr>
               </tbody>
@@ -393,12 +397,12 @@ HTML = r"""<!DOCTYPE html>
                 <tr><td class="text-nowrap pe-2"><code>thermal_width</code> / <code>thermal_height</code></td><td class="text-muted">Thermal frame size before it's resized to match the visible capture</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>thermal_spi_speed_hz</code></td><td class="text-muted">SPI clock speed to the thermal sensor (default 2,000,000 = 2 MHz) — lower if the log shows frequent CRC errors</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>thermal_hflip</code> / <code>thermal_vflip</code></td><td class="text-muted">Flip the thermal frame so it agrees with the (correctly rotated) visible frame on left/right and up/down — set based on a real test, not guessed</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_max_skew_s</code></td><td class="text-muted">Maximum time gap allowed between the visible exposure and the thermal frame fused with it. A capture that can't be paired this closely is <strong>discarded</strong>, not saved unpaired — a mistimed pair is wrong data, not degraded data, once the subject moves. Defaults to <code>0.75 / thermal_fps</code> (83ms at 9fps). The floor is half a thermal frame interval (56ms at 9fps), since no thermal data exists between frames — asking for less just discards captures. Raise <code>thermal_fps</code> to tighten it</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>thermal_stall_warn_s</code></td><td class="text-muted">Log a warning if the thermal sensor produces no frames for this long (default 5.0). Without this a stalled sensor is invisible — the last good frame would otherwise keep being fused into fresh captures</td></tr>
               </tbody>
             </table>
 
           </div>
-                <tr><td class="text-nowrap pe-2"><code>thermal_max_skew_s</code></td><td class="text-muted">Maximum time gap allowed between the visible exposure and the thermal frame fused with it. A capture that can't be paired this closely is <strong>discarded</strong>, not saved unpaired — a mistimed pair is wrong data, not degraded data, once the subject moves. Defaults to <code>0.75 / thermal_fps</code> (83ms at 9fps). The floor is half a thermal frame interval (56ms at 9fps), since no thermal data exists between frames — asking for less just discards captures. Raise <code>thermal_fps</code> to tighten it</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>thermal_stall_warn_s</code></td><td class="text-muted">Log a warning if the thermal sensor produces no frames for this long (default 5.0). Without this a stalled sensor is invisible — the last good frame would otherwise keep being fused into fresh captures</td></tr>
         </div>
       </div>
     </div>

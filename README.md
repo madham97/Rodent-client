@@ -103,36 +103,39 @@ Key settings:
 - `webp_compress` / `webp_quality` — re-encode JPEGs as WebP before upload to reduce transfer size
 - `poll_interval` — seconds between outbox checks (default 10)
 - `max_retries` / `retry_delay` — upload retry behaviour
+- `http_action_timeout` — seconds to wait for the modem's `+HTTPACTION` verdict (default 60). Measured round-trips on 2G are 26–37 s; waiting longer does not recover a verdict lost to a USB endpoint stall, it only slows the queue
+- `confirm_path` — path used to ask the server whether an image already arrived, after a stall swallowed the modem's reply (default `/annotate/specific/{name}`, where `{name}` is the name the server files it under — `<stem>.jpg` when `webp_compress` is on). Prevents re-sending an image that was in fact delivered; set to `""` to disable
 
 **GSM**
 - `gsm_device` — serial port: `/dev/serial0` for GPIO UART mode, `/dev/ttyUSB0` for USB mode (see `docs/gsm-hat-setup.md`)
+- `gsm_baud` — modem serial speed (default 115200); must match the modem's `AT+IPR` setting
 - `gsm_pin` — SIM PIN (blank if not required)
 - `gsm_apn` — data APN for your carrier
 - `gsm_number` — phone number of the SIM (e.g. `+447700900123`), shown in the dashboard — useful to note here so you know what number to send SMS config commands to
 
 **Recording**
 - `recording.mode` — `image_motion` or `image_interval`
-- `recording.motion_threshold` — fraction of pixels that must change to trigger (0–1, default 0.015)
-- `recording.motion_cooldown` — seconds to wait after a capture before checking for motion again
-- `recording.image_interval` — seconds between captures in interval mode
 - `recording.capture_backend` — `picamera2` (default) streams the camera continuously with a pre-trigger buffer; `rpicam` runs a fresh `rpicam-still` per capture, costing ~1s of camera init before every exposure. Falls back to `rpicam` automatically if picamera2 can't start
 - `recording.camera_fps` — stream frame rate for the `picamera2` backend (default 15)
 - `recording.camera_buffer_s` — seconds of full-res frames kept in the pre-trigger buffer (default 1.5, ~3MB per frame). Must be longer than the delay between motion onset and detection firing, or the onset frame is already gone
-- `recording.image_quality` — JPEG quality 1–100 (default 75)
-- `recording.image_rotation` — software rotation in degrees clockwise (`0`/`90`/`180`/`270`) to correct how the CSI camera is physically mounted. `rpicam-still` only supports 0/180 in hardware, so 90/270 mounts need this. Unlike `--hflip`/`--vflip`, a rotation preserves left/right handedness — important once this feed is paired with the thermal feed (see [Thermal Camera](#thermal-camera))
+- `recording.motion_threshold` — fraction of pixels that must change to trigger (0–1, default 0.015)
+- `recording.motion_cooldown` — seconds to wait after a capture before checking for motion again
 - `recording.detection_interval` — seconds between motion checks. On the `picamera2` backend a check costs ~0.06s instead of ~0.6s, so this can be much shorter than it used to be; keep it below `camera_buffer_s`
 - `recording.baseline_frames` — frames averaged into the motion baseline (default 3). Rebuilt after every trigger, and the recorder is blind while it happens
+- `recording.image_interval` — seconds between captures in interval mode
+- `recording.image_quality` — JPEG quality 1–100 (default 75)
+- `recording.image_rotation` — software rotation in degrees clockwise (`0`/`90`/`180`/`270`) to correct how the CSI camera is physically mounted. `rpicam-still` only supports 0/180 in hardware, so 90/270 mounts need this. Unlike `--hflip`/`--vflip`, a rotation preserves left/right handedness — important once this feed is paired with the thermal feed (see [Thermal Camera](#thermal-camera))
 - `recording.width` / `recording.height` — capture resolution (default 1280×720)
 - `recording.motion_debug` — set `true` to log the motion ratio on every check, useful for tuning `motion_threshold`
 - `recording.thermal_enabled` — fuse the GPIO thermal camera into every capture (default `false`, see [Thermal Camera](#thermal-camera))
 - `recording.thermal_fps` / `recording.thermal_filters` / `recording.thermal_offset` — thermal sensor stream settings
 - `recording.thermal_width` / `recording.thermal_height` — thermal frame size before it's resized to match the visible capture
 - `recording.thermal_spi_speed_hz` — SPI clock speed to the thermal sensor (default 2,000,000 = 2 MHz); lower it if the log shows frequent CRC errors (see [Thermal Camera](#thermal-camera))
+- `recording.thermal_max_skew_s` — maximum time gap allowed between the visible exposure and the thermal frame fused with it; captures that can't be paired this closely are **discarded**. Defaults to `0.75 / thermal_fps` (83ms at 9fps). The floor is half a thermal frame interval (56ms at 9fps) — raise `thermal_fps` to tighten it (see [Thermal Camera](#thermal-camera))
+- `recording.thermal_stall_warn_s` / `recording.camera_stall_warn_s` — log a warning if either stream produces no frames for this long (default 5.0 each)
 - `recording.thermal_hflip` / `recording.thermal_vflip` — flip the thermal frame so it agrees with the visible frame's left/right and up/down. The MI48's readout orientation is independent of the CSI camera's, so this needs to be set from an actual test (see [Thermal Camera](#thermal-camera)), not assumed
 
 Restart the relevant service after any change:
-- `recording.thermal_max_skew_s` — maximum time gap allowed between the visible exposure and the thermal frame fused with it; captures that can't be paired this closely are **discarded**. Defaults to `0.75 / thermal_fps` (83ms at 9fps). The floor is half a thermal frame interval (56ms at 9fps) — raise `thermal_fps` to tighten it (see [Thermal Camera](#thermal-camera))
-- `recording.thermal_stall_warn_s` / `recording.camera_stall_warn_s` — log a warning if either stream produces no frames for this long (default 5.0 each)
 ```bash
 sudo systemctl restart monitoring-pipeline-recorder  # after recording changes
 sudo systemctl restart monitoring-pipeline-uploader  # after upload/GSM changes
@@ -194,6 +197,13 @@ venv/bin/python3 pi-client/test_record_upload.py
 
 This captures a test image with `rpicam-still` (or falls back to a 1×1 dummy JPEG if no camera is attached), POSTs it to the configured server URL, and reports success or failure.
 
+Test the uploader's failure handling (no modem, no network, no server — runs anywhere):
+```bash
+venv/bin/python3 pi-client/test_uploader_recovery.py
+```
+
+This pins down behaviour that is easy to regress because the faults all look alike in a log: a stalled serial link, a delivered image whose reply was lost, and a genuinely rejected image must be handled differently, and only the last one may be parked in `failed/`.
+
 ## Tailscale
 
 ```bash
@@ -222,6 +232,8 @@ Set `recording.thermal_enabled: true` in `client.json` and restart the recorder 
 - Expect a few dropped captures at startup while the thermal sensor warms up. That is normal.
 - The uploader's WebP compression (`webp_compress`) applies to fused PNGs too and preserves the alpha channel, keeping combined captures well under the SIM800's 300KB upload limit.
 
+**How close is "simultaneous"?** The limit is the thermal sensor's frame rate: at `thermal_fps: 9` frames are 111ms apart, so nearest-neighbour pairing can only ever land within half an interval (~56ms) — there is no thermal data in between to pair with. Measured on real captures: typically ±10–60ms. Raising `thermal_fps` tightens this (25fps → ~20ms floor) but stresses the SPI link; see CRC errors below.
+
 **Aligning the two feeds (rotation and mirroring)**
 
 The CSI ribbon camera and the GPIO thermal sensor are independent hardware with independent, arbitrary mounting/readout orientations — there's no default that's correct for every unit. Two separate corrections may be needed, and they're not interchangeable:
@@ -232,8 +244,6 @@ The CSI ribbon camera and the GPIO thermal sensor are independent hardware with 
 Figure out both empirically, don't guess:
 1. Set `image_rotation` first: capture a frame and check the visible image is upright. Test all 4 values if needed.
 2. Once the visible frame is upright, run `record_combined.py` and raise **one specific hand** (note which). Check the RGB pane: for a camera facing you (not a mirror/selfie view), your right hand should appear on the image's *left* side — that's the correct, unmirrored convention for a monitoring camera. If it's backwards, that means the visible feed itself needs a hardware/software hflip too (not covered by `image_rotation`).
-**How close is "simultaneous"?** The limit is the thermal sensor's frame rate: at `thermal_fps: 9` frames are 111ms apart, so nearest-neighbour pairing can only ever land within half an interval (~56ms) — there is no thermal data in between to pair with. Measured on real captures: typically ±10–60ms. Raising `thermal_fps` tightens this (25fps → ~20ms floor) but stresses the SPI link; see CRC errors below.
-
 3. Compare the thermal pane to the now-correct RGB pane in the same frame: does the warm blob (your raised hand) line up on the same side as the RGB hand? If not, toggle `thermal_hflip` (or `thermal_vflip` if it's an up/down mismatch instead) and re-test until they agree.
 
 **CRC errors / dropped thermal frames**
@@ -278,6 +288,8 @@ Full wiring, config, and installation instructions: [`docs/thermal-camera-setup.
 | Uploader exits immediately | Check `gsm_device` in config (`/dev/serial0` for GPIO, `/dev/ttyUSB0` for USB); verify SIM PIN |
 | Images not appearing on server | Check `server_url` in config; verify server is reachable (`curl <url>/health`) |
 | `/outbox` growing, nothing uploaded | Check GSM signal in dashboard; check uploader logs |
+| Log repeats `Modem link fault ... (+HTTPSTATUS: POST,0,0,0)` | The modem gave no verdict for the upload. `POST,0,0,0` only means the HTTP engine is **idle** — it does *not* mean the upload failed, and the POST has often already been delivered. Usually a USB endpoint stall (`dmesg \| grep -c 'urb stopped'`); work the physical layer first. Images stay queued and delivery is confirmed against the server before any re-send. See [`docs/gsm-hat-setup.md`](docs/gsm-hat-setup.md#telling-a-dead-data-path-apart-from-a-dead-modem) |
+| Log repeats `Serial read path is dead (USB endpoint stalled)` | A GPRS data attempt halted the CP2102 bulk-IN endpoint (`dmesg \| grep 'urb stopped'`); the uploader re-opens the port itself. Frequent stalls with uploads otherwise working are worth reporting, not fatal |
 | Motion not triggering | Lower `motion_threshold` or enable `motion_debug` to see live ratios |
 | Dashboard not accessible | Check webui service is running; confirm Tailscale is authenticated |
 | SMS commands not working | Confirm modem is registered (`AT+CREG?`); check uploader log for `SMS from` lines; ensure SIM can receive SMS |

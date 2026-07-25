@@ -67,6 +67,7 @@ Important files:
 | `pi-client/uploader.py` | Uploads images to the server through the GSM modem. |
 | `pi-client/web_ui.py` | Flask dashboard for status, logs, config, and service actions. |
 | `pi-client/test_record_upload.py` | Test script for camera capture and direct upload. |
+| `pi-client/test_uploader_recovery.py` | Offline tests for the uploader's failure handling — no modem or network needed. |
 | `config/client.json.template` | Starting template for device configuration. |
 | `install.sh` | First-time Pi installer. |
 | `systemd/` | systemd unit files for recorder, uploader, and web UI. |
@@ -240,9 +241,13 @@ The uploader processes the oldest outbox image first. It builds a `multipart/for
 <server_url>/upload
 ```
 
-If the server returns HTTP `200`, the image is moved from `/outbox` to `/uploaded`, and the sidecar is deleted.
+If the server returns HTTP `200`, the image is moved from the outbox to `uploaded/`, and the sidecar is deleted.
 
-The SIM800/SIM868 modem has a practical HTTP body limit. Files over roughly `300 KB` are skipped and moved aside, so WebP compression is important for cellular reliability.
+If the server returns an error, the image is retried and then parked in `failed/` — kept for a later re-send rather than deleted, and out of the queue so it cannot block the images behind it.
+
+If the *modem* fails rather than the server, no verdict is available and the image stays queued. This matters because the two look similar in a log but need opposite handling: parking images on a transport fault would empty the outbox into `failed/` during any outage and make a network problem look like a pile of bad captures. Before re-sending, the uploader asks the server whether that image already arrived, since a lost reply does not mean a lost upload.
+
+The SIM800/SIM868 modem has a practical HTTP body limit of roughly `300 KB`. The uploader re-encodes each image to WebP and, if it still overshoots, progressively lowers quality and then scale until it fits, so WebP compression is important for cellular reliability. An image that cannot be made to fit is parked in `failed/`.
 
 ## SMS Remote Configuration
 

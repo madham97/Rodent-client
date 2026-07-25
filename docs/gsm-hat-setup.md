@@ -113,6 +113,111 @@ Even after getting the hardware right (correct port, correct jumpers), the uploa
 
 The fix was changing `rtscts=True` → `rtscts=False` in `SIM800.open()` in `pi-client/uploader.py:192`.
 
+### USB read endpoint stalls during GPRS data (2026-07-25)
+
+**Symptom**: uploads stop; the log fills with `Modem did not enter DOWNLOAD state:` (note the
+empty response) interleaved with `GPRS bearer opened` every ~12 s, and every image ends up
+parked in `failed/`.
+
+**What is actually happening**: a GPRS data attempt (`AT+HTTPACTION`, `AT+SAPBR=1,1`,
+`AT+SAPBR=0,1`) halts the CP2102's bulk-IN endpoint. The kernel logs
+
+```
+cp210x ttyUSB0: usb_serial_generic_read_bulk_callback - urb stopped: -32
+```
+
+`-32` is `-EPIPE`. The usb-serial driver does not resubmit the read URB after that status, so
+**the file descriptor never delivers another byte, while writes keep succeeding**. Every
+subsequent AT command looks like it returned an empty response, forever. Only re-opening the
+port recovers it — `ATZ`, `AT+CFUN=1,1` and bearer cycling cannot, because their replies are
+unreadable too. Counting the messages is the quickest confirmation:
+
+```bash
+dmesg | grep -c 'urb stopped'     # increments by 2 on every stall
+```
+
+This is *not* power-related: `AT+CBC` stays at 3994–3999 mV throughout, and the Pi reports
+`vcgencmd get_throttled` = `0x0`. It is also not an idle timeout — an open port left untouched
+for 3 minutes stays healthy. Only radio/data operations trigger it.
+
+`uploader.py` now re-opens the port automatically when a response comes back empty
+(`SIM800.reopen()`), so a stall costs one retry instead of the whole service.
+
+**Ruled out as causes** (each tested directly, so don't re-test these):
+
+| Suspected cause | Test | Result |
+|---|---|---|
+| Power / brownout on TX | `AT+CBC` sampled every second across a data attempt | Steady 3994–3999 mV; `vcgencmd get_throttled` = `0x0`. Not power |
+| USB autosuspend | `/sys/bus/usb/devices/1-1.2/power/control` | `on`, `runtime_suspended_time` 0. Not autosuspend |
+| Idle timeout | Port held open 180 s with no traffic | No stall. Only radio/data activity triggers it |
+| `reset_input_buffer()` (cp210x PURGE) racing incoming data | Full upload with zero purge calls | Stalled anyway. Not the purge |
+| UART speed | 5 × `GET /health` at each of 115200 / 19200 / 9600 baud (`AT+IPR`) | **0/5 verdicts and 5/5 stalled at every speed**, exactly 2 `urb stopped` per attempt. Baud is irrelevant |
+
+**Actual cause: the USB port.** The HAT was on port `1-1.2` of the external USB2.0 hub
+(VIA Labs `2109:3431`). Moving it to `1-1.1` on the same hub fixed it outright:
+
+| | Verdicts received | Trials stalled |
+|---|---|---|
+| Port `1-1.2` (115200 / 19200 / 9600) | 0/15 | 15/15 |
+| Port `1-1.1` | 4/4 | 0/4 |
+
+Uploads resumed immediately after the move (`Upload successful ... 62.2s, 2.0 KB/s`), and the
+reported signal rose from 16–17/31 to 21/31. So the stall was specific to that port/connector
+path, not to the module, the SIM, the carrier, or the software.
+
+**If it comes back**, work the physical layer first — that is where this fault lives:
+
+- Move the HAT to a different USB port, and prefer **directly into the Pi's USB 3.0 (blue)
+  port rather than through the hub** — the hub is an extra failure point this rig does not need.
+- Reseat or replace the USB cable; try a shorter or shielded one, or add a ferrite. A 2G
+  transmit burst coupling into the cable is a classic source of endpoint stalls.
+- Check `dmesg | grep -c 'urb stopped'` before and after a data attempt: 2 new lines per
+  attempt is the signature.
+
+Note that GPIO UART mode is **not** available as a fallback on this unit — the thermal camera
+occupies the GPIO header (see `docs/thermal-camera-setup.md`), so the USB path is the only
+option and its physical health matters.
+
+### Telling a dead data path apart from a dead modem
+
+A stalled port makes a healthy modem look dead, so check the module *before* suspecting the
+hardware. Stop the uploader first, then (see `## Verifying the Setup` below for the harness):
+
+| Command | Healthy answer | Meaning |
+|---------|----------------|---------|
+| `AT+CPIN?` | `+CPIN: READY` | SIM unlocked |
+| `AT+CREG?` | `+CREG: 0,1` or `0,5` | registered |
+| `AT+CGATT?` | `+CGATT: 1` | attached to GPRS |
+| `AT+CSQ` | 10–31 | signal present |
+| `AT+SAPBR=2,1` | `+SAPBR: 1,1,"<ip>"` | bearer up, IP assigned |
+| `AT+CBC` | ~4000 mV | module supply is fine |
+| `AT+HTTPSTATUS?` | `POST,0,0,0` | HTTP engine **idle** — see the warning below |
+
+**`POST,0,0,0` does not mean the upload failed.** `<mode>,<status>,<finish>,<remain>` with
+status `0` means *idle*, and an engine that has already finished reads exactly the same as one
+that never started. During this investigation that reading was initially taken as proof that
+the carrier was moving no data — it was wrong. The uploads were in fact arriving and being
+answered `200`; only the modem's reply was being lost to the USB stall. Do not diagnose a dead
+data path from this value.
+
+**Ask the server instead — it is the only reliable witness.** The modem cannot tell you whether
+a POST landed once its reply is lost:
+
+```bash
+# Did this specific image arrive? The server re-encodes an uploaded .webp to <stem>.jpg,
+# so ask for the .jpg name, not the local .png/.webp name — the wrong extension always 404s.
+curl -s -o /dev/null -w '%{http_code}\n' <server_url>/annotate/specific/<stem>.jpg
+
+curl -s <server_url>/health          # over WiFi: proves the server itself is fine
+```
+
+If the server has the image, the upload worked and the verdict was lost in transit — a local
+serial/USB fault, not a network or carrier one. `uploader.py` performs exactly this check
+automatically (`confirm_path`) before re-sending anything.
+
+Note that `AT+CDNSGIP` and `AT+CIPPING` are **not** valid tests here — they belong to the CIP
+stack, not the SAPBR bearer that HTTP uses, and return `ERROR` regardless of data health.
+
 ---
 
 ## Verifying the Setup
