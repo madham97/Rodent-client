@@ -13,6 +13,7 @@
   "max_retries":   3,
   "retry_delay":   10,
   "http_action_timeout": 180,
+  "thermal_hflip_at_upload": false,
   "confirm_path":  "/annotate/specific/{name}",
   "webp_compress": true,
   "webp_quality":  80,
