@@ -125,7 +125,8 @@ Key settings:
 - `recording.baseline_frames` — frames averaged into the motion baseline (default 3). Rebuilt after every trigger, and the recorder is blind while it happens
 - `recording.image_interval` — seconds between captures in interval mode
 - `recording.image_quality` — JPEG quality 1–100 (default 75)
-- `recording.image_rotation` — software rotation in degrees clockwise (`0`/`90`/`180`/`270`) to correct how the CSI camera is physically mounted. `rpicam-still` only supports 0/180 in hardware, so 90/270 mounts need this. Unlike `--hflip`/`--vflip`, a rotation preserves left/right handedness — important once this feed is paired with the thermal feed (see [Thermal Camera](#thermal-camera))
+- `recording.image_rotation` — software rotation in degrees clockwise (`0`/`90`/`180`/`270`) to correct how the CSI camera is physically mounted. `rpicam-still` only supports 0/180 in hardware, so 90/270 mounts need this. Unlike a flip, a rotation preserves left/right handedness — important once this feed is paired with the thermal feed (see [Thermal Camera](#thermal-camera))
+- `recording.image_hflip` / `recording.image_vflip` — mirror the visible feed left/right or up/down. A rotation cannot express a mirror, so a feed that arrives mirrored needs this instead. Applied after `image_rotation`, so the axes refer to the upright image
 - `recording.width` / `recording.height` — capture resolution (default 1280×720)
 - `recording.motion_debug` — set `true` to log the motion ratio on every check, useful for tuning `motion_threshold`
 - `recording.thermal_enabled` — fuse the GPIO thermal camera into every capture (default `false`, see [Thermal Camera](#thermal-camera))
@@ -134,6 +135,7 @@ Key settings:
 - `recording.thermal_spi_speed_hz` — SPI clock speed to the thermal sensor (default 2,000,000 = 2 MHz); lower it if the log shows frequent CRC errors (see [Thermal Camera](#thermal-camera))
 - `recording.thermal_max_skew_s` — maximum time gap allowed between the visible exposure and the thermal frame fused with it; captures that can't be paired this closely are **discarded**. Defaults to `0.75 / thermal_fps` (83ms at 9fps). The floor is half a thermal frame interval (56ms at 9fps) — raise `thermal_fps` to tighten it (see [Thermal Camera](#thermal-camera))
 - `recording.thermal_stall_warn_s` / `recording.camera_stall_warn_s` — log a warning if either stream produces no frames for this long (default 5.0 each)
+- `recording.thermal_rotation` — rotation of the thermal feed in degrees clockwise (`0`/`90`/`180`/`270`), the thermal counterpart to `image_rotation`, for a sensor mounted at a different angle to the camera. Applied before the thermal flips; a 90/270 rotation swaps the frame's aspect ratio and the result is stretched to the visible frame when fused
 - `recording.thermal_hflip` / `recording.thermal_vflip` — flip the thermal frame so it agrees with the visible frame's left/right and up/down. The MI48's readout orientation is independent of the CSI camera's, so this needs to be set from an actual test (see [Thermal Camera](#thermal-camera)), not assumed
 
 Restart the relevant service after any change:
@@ -239,13 +241,36 @@ Set `recording.thermal_enabled: true` in `client.json` and restart the recorder 
 
 The CSI ribbon camera and the GPIO thermal sensor are independent hardware with independent, arbitrary mounting/readout orientations — there's no default that's correct for every unit. Two separate corrections may be needed, and they're not interchangeable:
 
-- **`recording.image_rotation`** (0/90/180/270, applies to the visible feed) — corrects the CSI camera's physical mounting angle, in software, on both capture backends. A rotation *preserves* left/right handedness.
-- **`recording.thermal_hflip`** / **`thermal_vflip`** (applies to the thermal feed) — corrects the MI48's readout orientation, which is independent of the camera's mounting. A flip *reverses* left/right handedness — that's a fundamentally different kind of correction than a rotation, and one doesn't substitute for the other.
+Each feed has both a rotation and a pair of mirrors, and they are not interchangeable: a rotation *preserves* left/right handedness while a flip *reverses* it. On both feeds the rotation is applied first, so the flip axes refer to the upright image.
+
+| | Visible feed | Thermal feed |
+|---|---|---|
+| Rotate (0/90/180/270 clockwise) | `recording.image_rotation` | `recording.thermal_rotation` |
+| Mirror left/right | `recording.image_hflip` | `recording.thermal_hflip` |
+| Mirror up/down | `recording.image_vflip` | `recording.thermal_vflip` |
+
+- The **visible** controls correct the CSI camera's physical mounting, in software, on both capture backends.
+- The **thermal** controls correct the MI48's readout orientation, which is independent of the camera's mounting.
+- Correcting each feed separately is what brings the two into agreement. When they disagree, fix whichever feed is actually wrong — mirroring the visible feed to match a mirrored thermal frame leaves every uploaded photo mirrored.
 
 Figure out both empirically, don't guess:
 1. Set `image_rotation` first: capture a frame and check the visible image is upright. Test all 4 values if needed.
-2. Once the visible frame is upright, run `record_combined.py` and raise **one specific hand** (note which). Check the RGB pane: for a camera facing you (not a mirror/selfie view), your right hand should appear on the image's *left* side — that's the correct, unmirrored convention for a monitoring camera. If it's backwards, that means the visible feed itself needs a hardware/software hflip too (not covered by `image_rotation`).
-3. Compare the thermal pane to the now-correct RGB pane in the same frame: does the warm blob (your raised hand) line up on the same side as the RGB hand? If not, toggle `thermal_hflip` (or `thermal_vflip` if it's an up/down mismatch instead) and re-test until they agree.
+2. Once the visible frame is upright, run `record_combined.py` and raise **one specific hand** (note which). Check the RGB pane: for a camera facing you (not a mirror/selfie view), your right hand should appear on the image's *left* side — that's the correct, unmirrored convention for a monitoring camera. If it's backwards, set `image_hflip`.
+3. Compare the thermal pane to the now-correct RGB pane in the same frame: does the warm blob (your raised hand) line up on the same side as the RGB hand? If not, toggle `thermal_hflip` (or `thermal_vflip` for an up/down mismatch, or `thermal_rotation` if the whole frame is at the wrong angle) and re-test until they agree.
+
+A quick way to check a capture you already have, without re-running anything: overlay the hottest pixels of a fused PNG on its own visible channel and see whether they land on the warm object.
+
+```bash
+venv/bin/python3 -c "
+from PIL import Image; import numpy as np, sys
+im = Image.open(sys.argv[1]); im.load()
+rgb = np.asarray(im.convert('RGB'), float); a = np.asarray(im.getchannel('A'), float)
+hot = a > np.percentile(a, 88)
+rgb[hot] = rgb[hot] * 0.35 + np.array([255, 40, 40]) * 0.65
+Image.fromarray(rgb.astype('uint8')).save('/tmp/align-check.png')
+" data/uploaded/<image>.png
+# open /tmp/align-check.png — the red should sit on the warm subject, not beside it
+```
 
 **CRC errors / dropped thermal frames**
 

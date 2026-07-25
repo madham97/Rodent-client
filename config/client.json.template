@@ -33,6 +33,8 @@
     "image_interval":     30,
     "image_quality":      75,
     "image_rotation":     0,
+    "image_hflip":        false,
+    "image_vflip":        false,
     "thermal_enabled":       false,
     "thermal_fps":           9,
     "thermal_filters":       true,
@@ -41,6 +43,7 @@
     "thermal_width":         480,
     "thermal_height":        372,
     "thermal_spi_speed_hz":  2000000,
+    "thermal_rotation":      0,
     "thermal_hflip":         false,
     "thermal_vflip":         false
   }

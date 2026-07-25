@@ -39,6 +39,18 @@ STOP_FLAG = False
 _CV_ROTATE = {}
 
 
+def _valid_rotation(value, key):
+    """Coerce a rotation config value to 0/90/180/270, warning rather than failing."""
+    try:
+        rotation = int(value)
+    except (TypeError, ValueError):
+        rotation = -1
+    if rotation not in (0, 90, 180, 270):
+        logger.warning(f"Invalid {key} {value!r}, must be 0/90/180/270 — using 0")
+        return 0
+    return rotation
+
+
 def _cv_rotate_map():
     global _CV_ROTATE
     if not _CV_ROTATE:
@@ -78,7 +90,7 @@ class ThermalStream:
 
     def __init__(self, fps=9, filters=True, offset=0.0, out_width=480, out_height=372,
                  warmup_frames=5, spi_speed_hz=2_000_000, hflip=False, vflip=False,
-                 stall_warn_s=5.0, buffer_s=2.0):
+                 rotation=0, stall_warn_s=5.0, buffer_s=2.0):
         self.fps           = fps
         self.filters       = filters
         self.offset        = offset
@@ -87,6 +99,7 @@ class ThermalStream:
         self.spi_speed_hz  = spi_speed_hz
         self.hflip         = hflip
         self.vflip         = vflip
+        self.rotation      = rotation
         self.stall_warn_s  = stall_warn_s
 
         self.available   = False
@@ -178,7 +191,8 @@ class ThermalStream:
             try:
                 data, _ = read_frame(self._mi48, cs_pin)
                 gray8, stats = frame_to_gray8(data, self._mi48.fpa_shape, out_size=self.out_size,
-                                               hflip=self.hflip, vflip=self.vflip)
+                                               hflip=self.hflip, vflip=self.vflip,
+                                               rotation=self.rotation)
                 now = time.time()
                 with self._cond:
                     self._frames.append((now, gray8, stats))
@@ -365,10 +379,15 @@ class Recorder:
         # mounted at 90/270 (common with CSI ribbon cameras in compact enclosures), correct it
         # here in software instead — a rotation (unlike a flip) preserves left/right handedness,
         # which matters when this feed is later paired side by side with the thermal feed.
-        self.image_rotation = int(config.get('image_rotation', 0))
-        if self.image_rotation not in (0, 90, 180, 270):
-            logger.warning(f"Invalid image_rotation {self.image_rotation}, must be 0/90/180/270 — using 0")
-            self.image_rotation = 0
+        self.image_rotation = _valid_rotation(config.get('image_rotation', 0), 'image_rotation')
+        # Mirroring for the visible feed, the counterpart to thermal_hflip/thermal_vflip.
+        # image_rotation cannot express a mirror: a rotation preserves left/right handedness
+        # and a flip reverses it, so a feed that comes off the sensor mirrored (or a lens or
+        # mounting that reverses it) needs this instead. Correcting the two feeds separately
+        # is what lets them be brought into agreement with each other.
+        self.image_hflip = bool(config.get('image_hflip', False))
+        self.image_vflip = bool(config.get('image_vflip', False))
+
         # When rotating 90/270 in software, request the swapped dimensions from the sensor so
         # the rotated result comes out at the configured width x height without distortion.
         if self.image_rotation in (90, 270):
@@ -433,6 +452,7 @@ class Recorder:
                 spi_speed_hz=int(config.get('thermal_spi_speed_hz', 2_000_000)),
                 hflip=bool(config.get('thermal_hflip', False)),
                 vflip=bool(config.get('thermal_vflip', False)),
+                rotation=_valid_rotation(config.get('thermal_rotation', 0), 'thermal_rotation'),
                 stall_warn_s=float(config.get('thermal_stall_warn_s', 5.0)),
             )
             self._thermal.start()
@@ -573,8 +593,8 @@ class Recorder:
             if r.returncode == 0 and tmp.exists() and tmp.stat().st_size >= self.min_size_bytes:
                 # Rotation happens after the timestamp is taken — it re-encodes a 1920x1080 JPEG and
                 # would otherwise inflate the apparent exposure time by its own duration.
-                if self.image_rotation:
-                    self._rotate_in_place(tmp)
+                if self.image_rotation or self.image_hflip or self.image_vflip:
+                    self._reorient_in_place(tmp)
                 logger.info(f"Captured image: {path.name}")
                 return tmp, exposure_ts
             logger.warning(f"Image capture failed (code {r.returncode})")
@@ -585,16 +605,24 @@ class Recorder:
         tmp.unlink(missing_ok=True)
         return None
 
-    def _rotate_in_place(self, jpg_path: Path):
-        """Correct the physical camera mounting rotation (see `image_rotation`). PIL's rotate()
-        angle convention is counter-clockwise for positive values, so a clockwise correction
-        needs a negated angle."""
+    def _reorient_in_place(self, jpg_path: Path):
+        """Correct the camera's mounting rotation and any mirroring (see `image_rotation`,
+        `image_hflip`, `image_vflip`).
+
+        Rotation is applied first so the flip axes mean what they say in the final, upright
+        image rather than in sensor space. PIL's rotate() angle convention is
+        counter-clockwise for positive values, so a clockwise correction needs a negated
+        angle."""
         from PIL import Image
         with Image.open(jpg_path) as img:
-            rotated = img.rotate(-self.image_rotation, expand=True)
+            out = img.rotate(-self.image_rotation, expand=True) if self.image_rotation else img
+            if self.image_hflip:
+                out = out.transpose(Image.FLIP_LEFT_RIGHT)
+            if self.image_vflip:
+                out = out.transpose(Image.FLIP_TOP_BOTTOM)
             # jpg_path is the ".jpg.tmp" working file, so PIL can't infer the encoder from the
             # extension — pass it explicitly.
-            rotated.save(jpg_path, format='JPEG', quality=self.image_quality)
+            out.save(jpg_path, format='JPEG', quality=self.image_quality)
 
     def _fuse_thermal(self, visible_path: Path, exposure_ts: float):
         """
@@ -716,8 +744,14 @@ class Recorder:
         from PIL import Image
 
         rgb = cv.cvtColor(main_yuv, cv.COLOR_YUV420p2RGB)
+        # Rotate first, then mirror, so the flip axes refer to the upright image — the same
+        # order as the rpicam path in _reorient_in_place().
         if self.image_rotation:
             rgb = cv.rotate(rgb, _cv_rotate_map()[self.image_rotation])
+        if self.image_hflip:
+            rgb = cv.flip(rgb, 1)
+        if self.image_vflip:
+            rgb = cv.flip(rgb, 0)
         visible = Image.fromarray(rgb)
 
         stem = self.outbox_dir / self._make_filename_stem(vis_ts)
@@ -955,6 +989,8 @@ def load_config(path: str = None) -> dict:
         'image_interval':     5.0,
         'image_quality':      85,
         'image_rotation':     0,
+        'image_hflip':        False,
+        'image_vflip':        False,
         'thermal_enabled':       False,
         'thermal_fps':           9,
         'thermal_filters':       True,
@@ -969,6 +1005,7 @@ def load_config(path: str = None) -> dict:
         'camera_stall_warn_s':   5.0,
         'thermal_hflip':         False,
         'thermal_vflip':         False,
+        'thermal_rotation':      0,
         # None → derived from thermal_fps at runtime (see Recorder.__init__)
         'thermal_max_skew_s':    None,
         'thermal_stall_warn_s':  5.0,

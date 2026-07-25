@@ -122,7 +122,21 @@ def read_frame(mi48, cs_pin, timeout=3, retries=2):
     return data, header
 
 
-def frame_to_gray8(data, fpa_shape, out_size=(480, 372), hflip=False, vflip=False):
+def rotate_gray8(img8, rotation):
+    """Rotate an 8-bit frame clockwise by 0/90/180/270 degrees.
+
+    A 90/270 rotation transposes the frame, so the caller gets back an image whose width and
+    height are swapped relative to the input."""
+    if not rotation:
+        return img8
+    import cv2 as cv
+    codes = {90: cv.ROTATE_90_CLOCKWISE, 180: cv.ROTATE_180, 270: cv.ROTATE_90_COUNTERCLOCKWISE}
+    if rotation not in codes:
+        return img8
+    return cv.rotate(img8, codes[rotation])
+
+
+def frame_to_gray8(data, fpa_shape, out_size=(480, 372), hflip=False, vflip=False, rotation=0):
     """
     Convert raw MI48 frame data to an 8-bit single-channel image plus temperature stats.
 
@@ -137,6 +151,12 @@ def frame_to_gray8(data, fpa_shape, out_size=(480, 372), hflip=False, vflip=Fals
         relative to the (correctly oriented) visible-camera frame. Set hflip/vflip so the
         two feeds agree on left/right and up/down before pairing them side by side or
         fusing them.
+    rotation : int
+        Clockwise rotation in degrees (0/90/180/270), the thermal counterpart to the visible
+        feed's `image_rotation` — for a sensor mounted at a different angle to the camera.
+        Applied before the flips, so hflip/vflip refer to the upright thermal image. Note a
+        90/270 rotation swaps the frame's aspect ratio; the result is resized to the visible
+        frame when fused, so a mismatched aspect will stretch rather than crop.
 
     Returns
     -------
@@ -157,13 +177,17 @@ def frame_to_gray8(data, fpa_shape, out_size=(480, 372), hflip=False, vflip=Fals
     img8 = cv_filter(img8, parameters={'blur_ks': 3},
                       use_median=False, use_bilat=True, use_nlm=False)
     img8 = cv.resize(img8, out_size, interpolation=cv.INTER_CUBIC)
+    # Rotate first, then mirror, so hflip/vflip mean left/right and up/down in the upright
+    # image — the same order the visible feed uses.
+    img8 = rotate_gray8(img8, rotation)
     if hflip or vflip:
         flip_code = -1 if (hflip and vflip) else (1 if hflip else 0)
         img8 = cv.flip(img8, flip_code)
     return img8, stats
 
 
-def frame_to_image(data, fpa_shape, out_size=(480, 372), colormap=None, hflip=False, vflip=False):
+def frame_to_image(data, fpa_shape, out_size=(480, 372), colormap=None, hflip=False,
+                   vflip=False, rotation=0):
     """
     Convert raw MI48 frame data to an 8-bit colour image (numpy array, BGR).
 
@@ -173,12 +197,13 @@ def frame_to_image(data, fpa_shape, out_size=(480, 372), colormap=None, hflip=Fa
     fpa_shape  : mi48.fpa_shape  (rows, cols)
     out_size   : (width, height) for the output image
     colormap   : cv2 colormap constant (default: cv2.COLORMAP_INFERNO)
-    hflip, vflip : bool — see frame_to_gray8
+    hflip, vflip, rotation : see frame_to_gray8
     """
     import cv2 as cv
 
     if colormap is None:
         colormap = cv.COLORMAP_INFERNO
 
-    img8, _ = frame_to_gray8(data, fpa_shape, out_size=out_size, hflip=hflip, vflip=vflip)
+    img8, _ = frame_to_gray8(data, fpa_shape, out_size=out_size, hflip=hflip, vflip=vflip,
+                             rotation=rotation)
     return cv.applyColorMap(img8, colormap)
