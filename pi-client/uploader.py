@@ -224,18 +224,23 @@ class SIM800:
     """SIM800 modem controlled entirely via AT commands over a serial port."""
 
     def __init__(self, device='/dev/serial0', baud=115200, pin='', apn='web.vodafone.de',
-                 action_timeout=60):
+                 action_timeout=180, action_idle_polls=3):
         self.device = device
         self.baud   = baud
         self.pin    = pin
         self.apn    = apn
         self._ser   = None
-        # How long to wait for +HTTPACTION. Measured round-trips on this link are 26–37 s,
-        # so the old 180 s only ever added dead time: when the USB endpoint stalls the reply
-        # is already lost and no amount of waiting recovers it. A shorter wait means a
-        # stalled cycle costs ~1 minute instead of ~3.5, and the delivery check settles
-        # whether the POST landed.
+        # Upper bound on waiting for +HTTPACTION — not a fixed wait. _await_action_result()
+        # gives up as soon as AT+HTTPSTATUS stops showing progress, so this ceiling only
+        # applies to a transfer that is genuinely still moving. It must be generous: a 290 KB
+        # payload at 2 KB/s needs over two minutes, and cutting it short re-sends the whole
+        # image over 2G for nothing.
         self.action_timeout = action_timeout
+        # Consecutive no-progress polls before declaring the upload stuck.
+        self.action_idle_polls = max(1, action_idle_polls)
+        # Seconds spent listening between progress polls. Long enough that polling costs
+        # almost nothing on a slow link; shortened by the tests so they need not sleep.
+        self.action_poll_window = 6.0
 
     # ── Serial helpers ─────────────────────────────────────────────────────────
 
@@ -452,6 +457,82 @@ class SIM800:
 
     # ── HTTP ───────────────────────────────────────────────────────────────────
 
+    def _read_available(self, seconds: float) -> str:
+        """Read whatever arrives over `seconds`, without ever purging.
+
+        `_send` starts by discarding the input buffer, which is fine for a request/response
+        exchange but destructive while an unsolicited `+HTTPACTION:` may land at any moment."""
+        deadline = time.time() + seconds
+        buf = b''
+        while time.time() < deadline:
+            n = self._ser.in_waiting
+            if n:
+                buf += self._ser.read(n)
+            else:
+                time.sleep(0.05)
+        return buf.decode('ascii', errors='ignore')
+
+    @staticmethod
+    def _parse_httpstatus(buf: str):
+        """Latest `+HTTPSTATUS: <mode>,<status>,<finish>,<remain>` in buf, as (status, remain)."""
+        if '+HTTPSTATUS:' not in buf:
+            return None
+        try:
+            fields = buf.rsplit('+HTTPSTATUS:', 1)[1].split(',')
+            return int(fields[1]), int(fields[3].split()[0])
+        except (IndexError, ValueError):
+            return None
+
+    def _await_action_result(self) -> str:
+        """Wait for `+HTTPACTION:`, extending the wait while the transfer is demonstrably
+        moving bytes.
+
+        A fixed deadline cannot serve both cases at once. A 290 KB payload at 2 KB/s
+        legitimately needs well over two minutes, while a halted USB endpoint will never
+        answer no matter how long we wait — so any single timeout is either too short for
+        real uploads or too slow to notice a dead link. `AT+HTTPSTATUS` separates them:
+        status 2 with a falling `remain` means bytes are still going out.
+
+        Polling costs one command every few seconds and is safe mid-transfer, but it must not
+        purge the port, or the verdict can be thrown away just as it arrives."""
+        buf = ''
+        deadline = time.time() + self.action_timeout
+        last_remain = None
+        idle_polls = 0
+
+        while time.time() < deadline:
+            buf += self._read_available(self.action_poll_window)
+            if '+HTTPACTION:' in buf:
+                return buf
+
+            self._ser.write(b'AT+HTTPSTATUS?\r')
+            buf += self._read_available(max(0.2, self.action_poll_window / 3))
+            if '+HTTPACTION:' in buf:
+                return buf
+
+            progress = self._parse_httpstatus(buf)
+            if progress is None:
+                idle_polls += 1
+            else:
+                status, remain = progress
+                if status == 2 and (last_remain is None or remain < last_remain):
+                    if idle_polls:
+                        idle_polls = 0
+                else:
+                    idle_polls += 1
+                last_remain = remain
+
+            if idle_polls >= self.action_idle_polls:
+                logger.warning(
+                    f"Upload made no progress across {idle_polls} checks "
+                    f"(last +HTTPSTATUS remain={last_remain}) — not waiting out the full "
+                    f"{self.action_timeout}s"
+                )
+                return buf
+
+        logger.warning(f"Upload still had no verdict at the {self.action_timeout}s ceiling")
+        return buf
+
     def http_get(self, url: str) -> int:
         """GET url, returning the HTTP status code. Raises ModemLinkError if the modem never
         reports a result. Cheap enough (no body) to use as a delivery check."""
@@ -521,10 +602,10 @@ class SIM800:
             time.sleep(0.02)
         self._wait_for('OK', timeout=10)
 
-        # Fire the POST — GPRS round-trips can take up to 2 minutes.
+        # Fire the POST — GPRS round-trips can take minutes for a large payload.
         # heal=False: a re-sent HTTPACTION would POST the image a second time.
         self._send('AT+HTTPACTION=1', wait=0.5, heal=False)
-        result = self._wait_for('+HTTPACTION:', timeout=self.action_timeout)
+        result = self._await_action_result()
         # Read a bit more to capture the full line after the token arrives
         time.sleep(0.5)
         tail = self._ser.read(self._ser.in_waiting or 0)
@@ -551,7 +632,7 @@ class SIM800:
         diag = self._send('AT+HTTPSTATUS?', wait=1)
         self._send('AT+HTTPTERM', wait=0.5)
         state = diag.splitlines()[0].strip() if diag else '+HTTPSTATUS unreadable'
-        raise ModemLinkError(f"no +HTTPACTION result after {self.action_timeout}s ({state})")
+        raise ModemLinkError(f"no +HTTPACTION result ({state})")
 
 
 class Uploader:
@@ -587,7 +668,8 @@ class Uploader:
             device=config.get('gsm_device', '/dev/serial0'),
             pin=config.get('gsm_pin', ''),
             apn=config.get('gsm_apn', 'web.vodafone.de'),
-            action_timeout=int(config.get('http_action_timeout', 60)),
+            action_timeout=int(config.get('http_action_timeout', 180)),
+            action_idle_polls=int(config.get('http_action_idle_polls', 3)),
             baud=int(config.get('gsm_baud', 115200)),
         )
 

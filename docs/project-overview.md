@@ -154,7 +154,7 @@ Keys settable via SMS: `motion_threshold`, `motion_cooldown`, `detection_interva
   "poll_interval": 10,
   "max_retries":   3,
   "retry_delay":   10,
-  "http_action_timeout": 60,
+  "http_action_timeout": 180,
   "confirm_path":  "/annotate/specific/{name}",
   "webp_compress": true,
   "webp_quality":  80,

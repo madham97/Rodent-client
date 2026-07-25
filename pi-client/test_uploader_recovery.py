@@ -83,14 +83,42 @@ class StubModem(SIM800):
         return self.script.get(f'_wait:{token}', '')
 
 
-def _fake_serial_attr(modem):
-    """Minimal _ser for the http_post path, which reads directly off the port."""
-    modem._ser = type('S', (), {
-        'write': lambda *a: None,
-        'flush': lambda *a: None,
-        'read': lambda *a: b'',
-        'in_waiting': 0,
-    })()
+class ScriptedPort:
+    """Serial port that yields one queued chunk per command written to it.
+
+    Modelling the reply as something the modem sends *when polled* is what makes the
+    progress-tracking testable: a read window with no preceding command stays quiet, exactly
+    as it would on the wire."""
+
+    def __init__(self, chunks=()):
+        self.chunks = list(chunks)
+        self.written = []
+        self._armed = False        # nothing has been asked yet, so nothing is coming
+
+    @property
+    def in_waiting(self):
+        return len(self.chunks[0]) if (self._armed and self.chunks) else 0
+
+    def read(self, n=1):
+        if not (self._armed and self.chunks):
+            return b''
+        self._armed = False
+        return self.chunks.pop(0)
+
+    def write(self, data):
+        self.written.append(data)
+        self._armed = True         # a command went out, so a reply is due
+
+    def flush(self):
+        pass
+
+
+def _fake_serial_attr(modem, chunks=()):
+    """Give the modem a scripted port; http_post reads the verdict directly off it.
+    The poll window is shortened so the tests do not sleep through real timeouts."""
+    modem._ser = ScriptedPort(chunks)
+    modem.action_poll_window = 0.05
+    modem.action_timeout = 5
     return modem
 
 
@@ -147,7 +175,7 @@ check('bearer_open is False when the bearer reports disconnected',
 m = _fake_serial_attr(StubModem({
     'AT+HTTPINIT': 'OK', 'AT+HTTPPARA': 'OK', 'AT+HTTPDATA': 'DOWNLOAD',
     'AT+HTTPSTATUS?': '+HTTPSTATUS: POST,0,0,0\nOK',
-}))
+}), chunks=[b'\r\n+HTTPSTATUS: POST,0,0,0\r\nOK\r\n'] * 6)
 try:
     m.http_post('http://x/upload', b'x' * 20, 'multipart/form-data')
     check('missing +HTTPACTION raises ModemLinkError', False)
@@ -157,9 +185,46 @@ except ModemLinkError as e:
 
 m = _fake_serial_attr(StubModem({
     'AT+HTTPINIT': 'OK', 'AT+HTTPPARA': 'OK', 'AT+HTTPDATA': 'DOWNLOAD',
-    '_wait:+HTTPACTION:': '+HTTPACTION: 1,200,15',
-}))
+}), chunks=[b'\r\n+HTTPACTION: 1,200,15\r\n'])
 check('a real HTTP status is still returned', m.http_post('http://x/upload', b'x' * 20, 'ct') == 200)
+
+# ── Waiting for the verdict: progress must extend the wait, stalls must not ───
+
+def _await_with(chunks, timeout=30, idle_polls=3):
+    m = _fake_serial_attr(StubModem(), chunks)
+    m.action_timeout = timeout
+    m.action_idle_polls = idle_polls
+    return m, m._await_action_result()
+
+
+# A slow but healthy upload: remain keeps falling, then the verdict lands. Must not give up
+# even though it takes many polls — this is the 290 KB-on-2G case.
+progressing = [b'\r\n+HTTPSTATUS: POST,2,1000,%d\r\n\r\nOK\r\n' % r
+               for r in (200000, 150000, 100000, 50000, 10000)]
+progressing.append(b'\r\n+HTTPACTION: 1,200,15\r\n')
+m, out = _await_with(progressing)
+check('a progressing transfer is waited out to its verdict', '+HTTPACTION: 1,200,15' in out)
+
+# A stalled transfer: remain never moves. Must bail out early rather than burn the ceiling.
+m, out = _await_with([b'\r\n+HTTPSTATUS: POST,2,1000,50000\r\n\r\nOK\r\n'] * 12)
+check('a transfer stuck at the same byte count gives up early',
+      '+HTTPACTION:' not in out and len(m._ser.chunks) > 6)
+
+# A dead engine (the POST,0,0,0 case) must also bail out early.
+m, out = _await_with([b'\r\n+HTTPSTATUS: POST,0,0,0\r\n\r\nOK\r\n'] * 12)
+check('an idle engine gives up early', '+HTTPACTION:' not in out and len(m._ser.chunks) > 6)
+
+# The verdict must be recognised even when it shares a read with a status reply, since
+# polling must never purge the port.
+m, out = _await_with([b'\r\n+HTTPSTATUS: POST,2,1,9\r\n\r\nOK\r\n\r\n+HTTPACTION: 1,200,15\r\n'])
+check('a verdict arriving alongside a status poll is not lost',
+      '+HTTPACTION: 1,200,15' in out)
+
+check('_parse_httpstatus reads the latest sample',
+      SIM800._parse_httpstatus('+HTTPSTATUS: POST,2,10,900\nx\n+HTTPSTATUS: POST,2,20,800\n')
+      == (2, 800))
+check('_parse_httpstatus ignores junk', SIM800._parse_httpstatus('no status here') is None)
+
 
 # ── Queue behaviour ───────────────────────────────────────────────────────────
 

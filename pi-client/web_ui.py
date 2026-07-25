@@ -334,7 +334,8 @@ HTML = r"""<!DOCTYPE html>
                 <tr><td class="text-nowrap pe-2"><code>max_retries</code></td><td class="text-muted">Upload attempts before parking a file in <code>failed_dir</code></td></tr>
                 <tr><td class="text-nowrap pe-2"><code>retry_delay</code></td><td class="text-muted">Seconds between upload retries</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>poll_interval</code></td><td class="text-muted">Seconds between checks for new images</td></tr>
-                <tr><td class="text-nowrap pe-2"><code>http_action_timeout</code></td><td class="text-muted">Seconds to wait for the modem's upload verdict (default 60). Real 2G round-trips are 26–37s; waiting longer does not recover a verdict lost to a USB stall, it only slows the queue</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>http_action_timeout</code></td><td class="text-muted">Ceiling on waiting for the modem's upload verdict (default 180) — not a fixed wait. Progress is tracked with <code>AT+HTTPSTATUS</code>, so a slow-but-moving upload runs to completion while a stuck one is abandoned in ~25s. A 290KB payload at 2 KB/s needs over two minutes</td></tr>
+                <tr><td class="text-nowrap pe-2"><code>http_action_idle_polls</code></td><td class="text-muted">Consecutive checks showing no bytes moved before an upload is declared stuck (default 3, ~8s apart)</td></tr>
                 <tr><td class="text-nowrap pe-2"><code>confirm_path</code></td><td class="text-muted">Server path used to check whether an image already arrived, when the modem's reply was lost. Stops a delivered image being uploaded again. Set to empty to disable</td></tr>
               </tbody>
             </table>

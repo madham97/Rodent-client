@@ -103,7 +103,8 @@ Key settings:
 - `webp_compress` / `webp_quality` — re-encode JPEGs as WebP before upload to reduce transfer size
 - `poll_interval` — seconds between outbox checks (default 10)
 - `max_retries` / `retry_delay` — upload retry behaviour
-- `http_action_timeout` — seconds to wait for the modem's `+HTTPACTION` verdict (default 60). Measured round-trips on 2G are 26–37 s; waiting longer does not recover a verdict lost to a USB endpoint stall, it only slows the queue
+- `http_action_timeout` — **ceiling** on waiting for the modem's upload verdict (default 180), not a fixed wait. The uploader polls `AT+HTTPSTATUS` and keeps waiting only while bytes are still moving, so a slow-but-healthy transfer runs to completion while a stuck one is abandoned in ~25 s. Raise it only if a legitimate upload is being cut off — a 290 KB payload at 2 KB/s needs over two minutes
+- `http_action_idle_polls` — consecutive checks showing no progress before an upload is declared stuck (default 3, ~8 s apart)
 - `confirm_path` — path used to ask the server whether an image already arrived, after a stall swallowed the modem's reply (default `/annotate/specific/{name}`, where `{name}` is the name the server files it under — `<stem>.jpg` when `webp_compress` is on). Prevents re-sending an image that was in fact delivered; set to `""` to disable
 
 **GSM**
