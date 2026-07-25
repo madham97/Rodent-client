@@ -1,8 +1,9 @@
 {
   "server_url":    "http://your-server-url",
   "device_id":     "your-device-id",
-  "outbox_dir":    "/outbox",
-  "uploaded_dir":  "/uploaded",
+  "outbox_dir":    "/opt/Rodent-client/data/outbox",
+  "uploaded_dir":  "/opt/Rodent-client/data/uploaded",
+  "failed_dir":    "/opt/Rodent-client/data/failed",
   "gsm_device":    "/dev/serial0",
   "gsm_pin":       "",
   "gsm_apn":       "web.vodafone.de",

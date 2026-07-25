@@ -32,6 +32,10 @@ config/client.json.live-backup
 # Web UI credentials (never commit)
 config/webui.env
 
+# Pipeline data — captured images, upload queue, and processed/failed images
+# live inside the repo but must never be committed.
+/data/
+
 # Temporary files
 *.tmp
 *.mp4

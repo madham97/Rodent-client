@@ -90,7 +90,7 @@ echo "--- Installing ---"
 
 # ── Directories ────────────────────────────────────────────────────────────────
 mkdir -p "$INSTALL_DIR"/config
-mkdir -p /outbox /uploaded /var/log
+mkdir -p "$INSTALL_DIR"/data/outbox "$INSTALL_DIR"/data/uploaded "$INSTALL_DIR"/data/failed /var/log
 touch /var/log/monitoring-pipeline.log
 echo "Directories ready."
 
@@ -108,8 +108,9 @@ cat > "$INSTALL_DIR/config/client.json" << EOF
 {
   "server_url":    "$SERVER_URL",
   "device_id":     "$DEVICE_ID",
-  "outbox_dir":    "/outbox",
-  "uploaded_dir":  "/uploaded",
+  "outbox_dir":    "$INSTALL_DIR/data/outbox",
+  "uploaded_dir":  "$INSTALL_DIR/data/uploaded",
+  "failed_dir":    "$INSTALL_DIR/data/failed",
   "gsm_device":    "$GSM_DEVICE",
   "gsm_pin":       "$GSM_PIN",
   "gsm_apn":       "$GSM_APN",

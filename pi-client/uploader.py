@@ -468,6 +468,10 @@ class Uploader:
     def __init__(self, config):
         self.outbox_dir    = Path(config.get('outbox_dir', '/outbox'))
         self.uploaded_dir  = Path(config.get('uploaded_dir', '/uploaded'))
+        # Images that exhaust their retries are parked here so a single un-acceptable image (e.g.
+        # one the server 500s on) never blocks the oldest-first queue behind it. Kept, not
+        # deleted, so they can be re-sent once the server accepts them.
+        self.failed_dir    = Path(config.get('failed_dir', '/failed'))
         self.upload_url    = config.get('server_url', 'http://localhost:8000') + '/upload'
         self.max_retries   = int(config.get('max_retries', 3))
         self.retry_delay   = int(config.get('retry_delay', 60))
@@ -475,11 +479,6 @@ class Uploader:
 
         self.outbox_dir.mkdir(parents=True, exist_ok=True)
         self.uploaded_dir.mkdir(parents=True, exist_ok=True)
-        # Files that exhaust their retries are parked here so a single un-acceptable image (e.g.
-        # one the server 500s on) never blocks the oldest-first queue behind it. Kept, not
-        # deleted, so they can be re-sent once the server accepts them. Nested under outbox but
-        # ignored by _get_oldest_file (it is non-recursive and file-only).
-        self.failed_dir = self.outbox_dir / 'failed'
         self.failed_dir.mkdir(parents=True, exist_ok=True)
 
         self.webp_compress = bool(config.get('webp_compress', False))
@@ -675,6 +674,7 @@ def load_config(path=None):
     return {
         'outbox_dir':    '/outbox',
         'uploaded_dir':  '/uploaded',
+        'failed_dir':    '/failed',
         'server_url':    'http://localhost:8000',
         'max_retries':   3,
         'retry_delay':   60,
