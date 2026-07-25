@@ -106,6 +106,8 @@ A link fault must never be treated as a bad image: doing so drains the outbox in
 
 **Recovering a one-way serial link.** A GPRS data attempt can halt the CP2102's USB bulk-IN endpoint, after which the port accepts writes but never delivers another byte — every AT command appears to return an empty response forever. The uploader detects the empty response, re-opens the port (the only thing that clears it), and retries once. Commands that must not be duplicated (`AT+HTTPACTION`, SMS send) opt out via `heal=False`. See `docs/gsm-hat-setup.md` for the full diagnosis; the root cause was a faulty USB port.
 
+**Thermal/visible registration.** The MI48's readout can be mirrored horizontally relative to the CSI camera, which puts the thermal map on the wrong side of the visible scene — hot pixels from a subject on the right appear over the left. `thermal_hflip_at_upload` mirrors the alpha channel (only alpha; RGB is untouched) just before the image is encoded for upload. Correcting here rather than at capture means images already sitting in the queue are fixed too, which is the reason to prefer it over `recording.thermal_hflip` when a misregistered backlog exists. Enabling both cancels them out, so the uploader warns when it sees that.
+
 **Delivery confirmation.** If a stall swallows the modem's `+HTTPACTION` line, the POST may already have been delivered and answered 200. Before re-sending, the uploader asks the server whether the image is already there (`confirm_path`, a small bodyless GET). This runs at the *start* of the next cycle — after link recovery, on a working link — rather than immediately after the fault on the link that just failed.
 
 The modem class is named `SIM800` but works with SIM868/SIM800C as well (same AT command set).
@@ -157,6 +159,7 @@ Keys settable via SMS: `motion_threshold`, `motion_cooldown`, `detection_interva
   "retry_delay":   10,
   "http_action_timeout": 180,
   "confirm_path":  "/annotate/specific/{name}",
+  "thermal_hflip_at_upload": false,
   "webp_compress": true,
   "webp_quality":  80,
   "recording": {

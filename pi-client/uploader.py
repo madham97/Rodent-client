@@ -138,7 +138,22 @@ class SMSConfigHandler:
         return reply
 
 
-def _to_webp(file_path: Path, quality: int, max_bytes: int = None) -> tuple[bytes, str]:
+def _mirror_thermal_alpha(img):
+    """Mirror only the alpha channel of a fused RGBA frame, leaving RGB untouched.
+
+    The MI48's readout is horizontally mirrored relative to the CSI camera on this unit, so
+    the thermal map carried in alpha lands on the wrong side of the visible image: hot pixels
+    from a subject on the right appear over the left of the scene. Flipping alpha alone
+    re-registers the two without disturbing the visible frame."""
+    from PIL import Image
+    if 'A' not in img.getbands():
+        return img
+    r, g, b, a = img.convert('RGBA').split()
+    return Image.merge('RGBA', (r, g, b, a.transpose(Image.FLIP_LEFT_RIGHT)))
+
+
+def _to_webp(file_path: Path, quality: int, max_bytes: int = None,
+             mirror_thermal: bool = False) -> tuple[bytes, str]:
     """Re-encode a JPEG or PNG as WebP in memory. Alpha channels (e.g. thermal-fused RGBA
     PNGs) survive the conversion since WebP supports alpha. Returns (webp_bytes, webp_filename).
 
@@ -157,6 +172,8 @@ def _to_webp(file_path: Path, quality: int, max_bytes: int = None) -> tuple[byte
 
     with Image.open(file_path) as img:
         img.load()
+        if mirror_thermal:
+            img = _mirror_thermal_alpha(img)
         name = file_path.stem + '.webp'
         data = encode(img, quality)
         if max_bytes is None or len(data) <= max_bytes:
@@ -183,7 +200,8 @@ def _to_webp(file_path: Path, quality: int, max_bytes: int = None) -> tuple[byte
 
 
 def build_multipart(file_path: Path, metadata: dict = None, webp_compress: bool = False,
-                    webp_quality: int = 80, max_image_bytes: int = None) -> bytes:
+                    webp_quality: int = 80, max_image_bytes: int = None,
+                    mirror_thermal: bool = False) -> bytes:
     """Wrap image file in a multipart/form-data body with metadata text fields."""
     if metadata is None:
         metadata = {}
@@ -191,8 +209,18 @@ def build_multipart(file_path: Path, metadata: dict = None, webp_compress: bool 
     is_jpeg = file_path.suffix.lower() in ('.jpg', '.jpeg')
     is_png  = file_path.suffix.lower() == '.png'
     if (is_jpeg or is_png) and webp_compress:
-        data, filename = _to_webp(file_path, webp_quality, max_bytes=max_image_bytes)
+        data, filename = _to_webp(file_path, webp_quality, max_bytes=max_image_bytes,
+                                  mirror_thermal=mirror_thermal)
         content_type = 'image/webp'
+    elif is_png and mirror_thermal:
+        # Correction still has to happen with compression off, or it would silently not apply.
+        from PIL import Image
+        import io
+        with Image.open(file_path) as img:
+            img.load()
+            buf = io.BytesIO()
+            _mirror_thermal_alpha(img).save(buf, format='PNG')
+        data, filename, content_type = buf.getvalue(), file_path.name, 'image/png'
     else:
         data, filename = file_path.read_bytes(), file_path.name
         content_type = 'image/jpeg' if is_jpeg else 'image/png'
@@ -659,6 +687,18 @@ class Uploader:
 
         self.webp_compress = bool(config.get('webp_compress', False))
         self.webp_quality  = int(config.get('webp_quality', 80))
+
+        # Re-register a thermal map that the sensor delivers mirrored relative to the visible
+        # camera. Applied here rather than at capture so images already sitting in the queue
+        # are corrected too, not just future ones.
+        self.mirror_thermal = bool(config.get('thermal_hflip_at_upload', False))
+        if self.mirror_thermal:
+            logger.info("Thermal alpha will be mirrored horizontally before upload")
+            if config.get('recording', {}).get('thermal_hflip'):
+                logger.warning(
+                    "Both recording.thermal_hflip and thermal_hflip_at_upload are enabled — "
+                    "these correct the same mirroring, so together they cancel out. Turn one off."
+                )
         self._link_failures = 0   # consecutive cycles lost to a modem/link fault
         # Images whose POST ended without a verdict. Checked against the server on the next
         # cycle before being re-sent, so a delivered image is not uploaded twice.
@@ -705,7 +745,8 @@ class Uploader:
         # so build_multipart can adaptively compress a bulky thermal frame to fit.
         budget       = MAX_FILE_BYTES - 8192
         body         = build_multipart(file_path, metadata, self.webp_compress,
-                                       self.webp_quality, max_image_bytes=budget)
+                                       self.webp_quality, max_image_bytes=budget,
+                                       mirror_thermal=self.mirror_thermal)
         content_type = f'multipart/form-data; boundary={BOUNDARY}'
         size = len(body)
         logger.info(f"Uploading {file_path.name} ({size} bytes payload, attempt {attempt + 1})")

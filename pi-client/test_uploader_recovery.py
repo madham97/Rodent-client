@@ -37,7 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from PIL import Image as PILImage
 
-from uploader import SIM800, Uploader, ModemLinkError
+from uploader import (SIM800, Uploader, ModemLinkError, build_multipart,
+                      _mirror_thermal_alpha)
 
 _results = []
 
@@ -187,6 +188,51 @@ m = _fake_serial_attr(StubModem({
     'AT+HTTPINIT': 'OK', 'AT+HTTPPARA': 'OK', 'AT+HTTPDATA': 'DOWNLOAD',
 }), chunks=[b'\r\n+HTTPACTION: 1,200,15\r\n'])
 check('a real HTTP status is still returned', m.http_post('http://x/upload', b'x' * 20, 'ct') == 200)
+
+# ── Thermal/visible re-registration ───────────────────────────────────────────
+
+# A frame where RGB and alpha are both left/right asymmetric, so a mirror is detectable and
+# it is provable that only alpha moved.
+_asym = PILImage.new('RGBA', (8, 4), (0, 0, 0, 0))
+for y in range(4):
+    _asym.putpixel((1, y), (255, 0, 0, 0))       # red marker on the LEFT of RGB
+    _asym.putpixel((6, y), (0, 0, 0, 255))       # hot alpha on the RIGHT
+
+_m = _mirror_thermal_alpha(_asym)
+check('mirroring moves the hot alpha to the other side',
+      _m.getpixel((1, 0))[3] == 255 and _m.getpixel((6, 0))[3] == 0)
+check('mirroring leaves the visible channels alone',
+      _m.getpixel((1, 0))[:3] == (255, 0, 0) and _m.getpixel((6, 0))[:3] == (0, 0, 0))
+check('mirroring twice is the identity',
+      list(_mirror_thermal_alpha(_m).getdata()) == list(_asym.getdata()))
+check('a frame with no alpha is passed through untouched',
+      _mirror_thermal_alpha(PILImage.new('RGB', (4, 4), (1, 2, 3))).mode == 'RGB')
+
+_tmpdir = Path(tempfile.mkdtemp())
+_p = _tmpdir / 'image_20260725T120000Z.png'
+_asym.save(_p, format='PNG')
+
+
+def _alpha_of_upload(**kw):
+    """Decode the image actually placed in the multipart body."""
+    import io
+    body = build_multipart(_p, {'device_id': 'd'}, **kw)
+    part = body.split(b'name="image"', 1)[1]          # skip the metadata fields
+    blob = part.split(b'\r\n\r\n', 1)[1].rsplit(b'\r\n--PiPipeline--\r\n', 1)[0]
+    im = PILImage.open(io.BytesIO(blob))
+    im.load()
+    return [im.getpixel((1, 0))[3], im.getpixel((6, 0))[3]]
+
+
+check('upload leaves the frame as captured when the fix is off',
+      _alpha_of_upload(webp_compress=True, mirror_thermal=False) == [0, 255])
+check('upload mirrors the thermal channel when the fix is on',
+      _alpha_of_upload(webp_compress=True, mirror_thermal=True) == [255, 0])
+check('the fix still applies with webp compression disabled',
+      _alpha_of_upload(webp_compress=False, mirror_thermal=True) == [255, 0])
+
+shutil.rmtree(_tmpdir)
+
 
 # ── Waiting for the verdict: progress must extend the wait, stalls must not ───
 
