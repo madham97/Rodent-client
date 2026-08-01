@@ -136,7 +136,17 @@ def rotate_gray8(img8, rotation):
     return cv.rotate(img8, codes[rotation])
 
 
-def frame_to_gray8(data, fpa_shape, out_size=(480, 372), hflip=False, vflip=False, rotation=0):
+# Fixed encoding range for the 0-255 normalization, in °C. Chosen from the observed range
+# across ~200 real captures on this deployment (frame minimums 17.0-30.2°C, frame maximums
+# 27.5-39.6°C — see docs/decisions.md in the Server repo), with margin on both ends for
+# cooler nights / hotter surfaces than have been seen yet. See `frame_to_gray8` for why this
+# replaced per-frame NORM_MINMAX.
+DEFAULT_TEMP_NORM_MIN_C = 10.0
+DEFAULT_TEMP_NORM_MAX_C = 45.0
+
+
+def frame_to_gray8(data, fpa_shape, out_size=(480, 372), hflip=False, vflip=False, rotation=0,
+                    norm_min_c=DEFAULT_TEMP_NORM_MIN_C, norm_max_c=DEFAULT_TEMP_NORM_MAX_C):
     """
     Convert raw MI48 frame data to an 8-bit single-channel image plus temperature stats.
 
@@ -157,23 +167,41 @@ def frame_to_gray8(data, fpa_shape, out_size=(480, 372), hflip=False, vflip=Fals
         Applied before the flips, so hflip/vflip refer to the upright thermal image. Note a
         90/270 rotation swaps the frame's aspect ratio; the result is resized to the visible
         frame when fused, so a mismatched aspect will stretch rather than crop.
+    norm_min_c, norm_max_c : float
+        Fixed °C range the 0-255 output is linearly stretched from/to, the same every frame.
+        Values outside this range clip to 0/255.
+
+        This is deliberately NOT the frame's own min/max (which is what `cv.normalize(...,
+        NORM_MINMAX)` used to do here): stretching each frame to its own range means the same
+        real-world temperature maps to a different pixel value depending on whatever else is
+        in view that frame — a shadow, a bit of warm bedding, a hotter background — which
+        defeats any downstream analysis that needs comparable pixel values across frames
+        (background-subtraction-based detection/calibration, most notably; see
+        docs/decisions.md in the Server repo for the failure mode this caused). A fixed range
+        makes a given real temperature map to the same pixel value every time, at the cost of
+        some per-frame contrast when the actual scene's range is much narrower than
+        [norm_min_c, norm_max_c].
 
     Returns
     -------
     (img8, (temp_min_c, temp_max_c, temp_avg_c))
         img8 — normalized 8-bit numpy array, shape (out_size[1], out_size[0])
-        temps — the actual °C range the 0-255 normalization was stretched from,
-                needed to reconstruct real temperatures from a pixel value later:
-                temp_c = temp_min_c + (pixel / 255) * (temp_max_c - temp_min_c)
+        temps — the frame's *actual* observed °C range and mean (informational/telemetry
+                only — NOT the range the pixel values were encoded against; that's the fixed
+                norm_min_c/norm_max_c above). To recover an approximate real temperature from
+                a pixel value: temp_c = norm_min_c + (pixel / 255) * (norm_max_c - norm_min_c),
+                using whatever norm_min_c/norm_max_c this frame was actually encoded with —
+                lossy for any real value outside that range, since it clipped.
     """
+    import numpy as np
     import cv2 as cv
     from senxor.utils import data_to_frame, cv_filter
 
     frame = data_to_frame(data, fpa_shape)
     stats = (float(frame.min()), float(frame.max()), float(frame.mean()))
 
-    img8 = cv.normalize(frame.astype('float32'), None, 0, 255,
-                         norm_type=cv.NORM_MINMAX, dtype=cv.CV_8U)
+    scaled = (frame.astype('float32') - norm_min_c) * (255.0 / (norm_max_c - norm_min_c))
+    img8 = np.clip(scaled, 0, 255).astype('uint8')
     img8 = cv_filter(img8, parameters={'blur_ks': 3},
                       use_median=False, use_bilat=True, use_nlm=False)
     img8 = cv.resize(img8, out_size, interpolation=cv.INTER_CUBIC)
@@ -187,7 +215,8 @@ def frame_to_gray8(data, fpa_shape, out_size=(480, 372), hflip=False, vflip=Fals
 
 
 def frame_to_image(data, fpa_shape, out_size=(480, 372), colormap=None, hflip=False,
-                   vflip=False, rotation=0):
+                   vflip=False, rotation=0, norm_min_c=DEFAULT_TEMP_NORM_MIN_C,
+                   norm_max_c=DEFAULT_TEMP_NORM_MAX_C):
     """
     Convert raw MI48 frame data to an 8-bit colour image (numpy array, BGR).
 
@@ -197,7 +226,7 @@ def frame_to_image(data, fpa_shape, out_size=(480, 372), colormap=None, hflip=Fa
     fpa_shape  : mi48.fpa_shape  (rows, cols)
     out_size   : (width, height) for the output image
     colormap   : cv2 colormap constant (default: cv2.COLORMAP_INFERNO)
-    hflip, vflip, rotation : see frame_to_gray8
+    hflip, vflip, rotation, norm_min_c, norm_max_c : see frame_to_gray8
     """
     import cv2 as cv
 
@@ -205,5 +234,5 @@ def frame_to_image(data, fpa_shape, out_size=(480, 372), colormap=None, hflip=Fa
         colormap = cv.COLORMAP_INFERNO
 
     img8, _ = frame_to_gray8(data, fpa_shape, out_size=out_size, hflip=hflip, vflip=vflip,
-                             rotation=rotation)
+                             rotation=rotation, norm_min_c=norm_min_c, norm_max_c=norm_max_c)
     return cv.applyColorMap(img8, colormap)

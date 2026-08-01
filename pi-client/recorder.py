@@ -88,9 +88,16 @@ class ThermalStream:
     False) without affecting visible-camera capture.
     """
 
+    # Duplicated from thermal_common.DEFAULT_TEMP_NORM_MIN_C/MAX_C rather than imported, since
+    # thermal_common pulls in Pi-only hardware libs (smbus, spidev) at module scope and this
+    # class's constructor must stay importable on a dev machine without them.
+    _DEFAULT_NORM_MIN_C = 10.0
+    _DEFAULT_NORM_MAX_C = 45.0
+
     def __init__(self, fps=9, filters=True, offset=0.0, out_width=480, out_height=372,
                  warmup_frames=5, spi_speed_hz=2_000_000, hflip=False, vflip=False,
-                 rotation=0, stall_warn_s=5.0, buffer_s=2.0):
+                 rotation=0, stall_warn_s=5.0, buffer_s=2.0,
+                 norm_min_c=_DEFAULT_NORM_MIN_C, norm_max_c=_DEFAULT_NORM_MAX_C):
         self.fps           = fps
         self.filters       = filters
         self.offset        = offset
@@ -101,6 +108,8 @@ class ThermalStream:
         self.vflip         = vflip
         self.rotation      = rotation
         self.stall_warn_s  = stall_warn_s
+        self.norm_min_c    = norm_min_c
+        self.norm_max_c    = norm_max_c
 
         self.available   = False
         # Ring buffer of (capture_ts, gray8 ndarray, (temp_min_c, temp_max_c, temp_avg_c)).
@@ -192,7 +201,8 @@ class ThermalStream:
                 data, _ = read_frame(self._mi48, cs_pin)
                 gray8, stats = frame_to_gray8(data, self._mi48.fpa_shape, out_size=self.out_size,
                                                hflip=self.hflip, vflip=self.vflip,
-                                               rotation=self.rotation)
+                                               rotation=self.rotation,
+                                               norm_min_c=self.norm_min_c, norm_max_c=self.norm_max_c)
                 now = time.time()
                 with self._cond:
                     self._frames.append((now, gray8, stats))
@@ -454,6 +464,8 @@ class Recorder:
                 vflip=bool(config.get('thermal_vflip', False)),
                 rotation=_valid_rotation(config.get('thermal_rotation', 0), 'thermal_rotation'),
                 stall_warn_s=float(config.get('thermal_stall_warn_s', 5.0)),
+                norm_min_c=float(config.get('thermal_norm_min_c', ThermalStream._DEFAULT_NORM_MIN_C)),
+                norm_max_c=float(config.get('thermal_norm_max_c', ThermalStream._DEFAULT_NORM_MAX_C)),
             )
             self._thermal.start()
 
@@ -998,6 +1010,8 @@ def load_config(path: str = None) -> dict:
         'thermal_warmup_frames': 5,
         'thermal_width':         480,
         'thermal_height':        372,
+        'thermal_norm_min_c':    ThermalStream._DEFAULT_NORM_MIN_C,
+        'thermal_norm_max_c':    ThermalStream._DEFAULT_NORM_MAX_C,
         'thermal_spi_speed_hz':  2_000_000,
         'capture_backend':       'picamera2',
         'camera_fps':            15,
