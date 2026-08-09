@@ -1,5 +1,6 @@
 {
   "server_url":    "http://your-server-url",
+  "upload_token":  "",
   "device_id":     "your-device-id",
   "outbox_dir":    "/opt/Rodent-client/data/outbox",
   "uploaded_dir":  "/opt/Rodent-client/data/uploaded",

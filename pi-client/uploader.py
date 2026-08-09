@@ -28,6 +28,20 @@ logger = logging.getLogger(__name__)
 
 BOUNDARY = 'PiPipeline'
 MAX_FILE_BYTES = 300_000  # SIM800 internal HTTP buffer limit
+
+# Statuses meaning "this endpoint is refusing everything" — authorization, quota, or rate
+# limiting, whether from the server or a tunnel edge in front of it. No image gets through
+# until an operator changes something, so the uploader backs off instead of retrying.
+BLOCKED_STATUSES = {401, 402, 403, 407, 429, 451}
+# Statuses meaning "the server read this request and won't take this image". Retrying resends
+# identical bytes for an identical answer, so park immediately.
+REJECT_STATUSES  = {400, 413, 415, 422}
+
+# Backoff bounds applied after a BLOCKED_STATUSES response. Starts at one minute and doubles
+# to an hour, so a multi-week outage costs ~24 probe uploads a day instead of three per
+# capture — while still recovering on its own within an hour of the endpoint coming back.
+BLOCKED_BACKOFF_START = 60
+BLOCKED_BACKOFF_MAX   = 3600
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
 
 
@@ -199,7 +213,7 @@ def build_multipart(file_path: Path, metadata: dict = None, webp_compress: bool 
 
     body = b''
     always_keys    = ('device_id', 'mode', 'motion_score', 'timestamp')
-    optional_keys  = ('format', 'thermal_min_c', 'thermal_max_c', 'thermal_avg_c')
+    optional_keys  = ('format', 'thermal_min_c', 'thermal_max_c', 'thermal_avg_c', 'token')
     for key in always_keys + tuple(k for k in optional_keys if k in metadata):
         value = str(metadata.get(key, ''))
         body += (
@@ -659,7 +673,16 @@ class Uploader:
 
         self.webp_compress = bool(config.get('webp_compress', False))
         self.webp_quality  = int(config.get('webp_quality', 80))
+        # Shared secret the server checks on /upload. Sent as a multipart field rather than an
+        # HTTP header: the SIM800 only sets custom headers via AT+HTTPPARA="USERDATA", whose
+        # behaviour varies by firmware, and the body is already being built anyway. Empty means
+        # send nothing, which matches a server running without UPLOAD_TOKEN set.
+        self.upload_token  = str(config.get('upload_token', '')).strip()
         self._link_failures = 0   # consecutive cycles lost to a modem/link fault
+        # Set while the endpoint is returning a BLOCKED_STATUSES code. Until this passes,
+        # cycles are skipped without spending any cellular data on a POST that cannot succeed.
+        self._blocked_until   = 0.0
+        self._blocked_backoff = BLOCKED_BACKOFF_START
         # Images whose POST ended without a verdict. Checked against the server on the next
         # cycle before being re-sent, so a delivered image is not uploaded twice.
         self._unconfirmed = set()
@@ -698,12 +721,16 @@ class Uploader:
     def _upload(self, file_path: Path, metadata: dict, attempt=0) -> str:
         """Attempt one upload. Returns 'ok' (sent), 'toobig' (won't fit even after adaptive
         compression — don't retry), 'link' (modem/link fault: we never learned the server's
-        verdict, so keep the image queued), or 'retry' (server failure, retry may help)."""
+        verdict, so keep the image queued), 'blocked' (the endpoint is refusing everything —
+        keep the image queued and back off), 'reject' (the server refused this specific image —
+        park it), or 'retry' (server failure, retry may help)."""
         # Build the body first so the size check sees the actual POST payload the modem must
         # buffer — i.e. the WebP-compressed image, not the raw file. Give the image a byte budget
         # under the HTTP buffer (leaving margin for the multipart boundaries and metadata fields)
         # so build_multipart can adaptively compress a bulky thermal frame to fit.
         budget       = MAX_FILE_BYTES - 8192
+        if self.upload_token:
+            metadata = {**metadata, 'token': self.upload_token}
         body         = build_multipart(file_path, metadata, self.webp_compress,
                                        self.webp_quality, max_image_bytes=budget)
         content_type = f'multipart/form-data; boundary={BOUNDARY}'
@@ -735,10 +762,26 @@ class Uploader:
         if status in (601, 603):
             logger.info("Attempting to re-open GPRS bearer...")
             self.modem.bearer_open()
+            return 'retry'
+
+        # The endpoint is refusing every request, not this image: a bad/absent upload token, or
+        # a tunnel edge answering for a server it won't forward to (ngrok returns 403 once the
+        # account's bandwidth quota is spent). Retrying costs a full ~120 KB POST and cannot
+        # succeed, so treat it as an outage — the image stays queued and the caller backs off.
+        if status in BLOCKED_STATUSES:
+            return 'blocked'
+
+        # The server understood the request and rejected this particular image. Retrying sends
+        # the same bytes to the same verdict, so park it rather than paying for two more.
+        if status in REJECT_STATUSES:
+            return 'reject'
 
         return 'retry'
 
     def _process_oldest(self) -> bool:
+        if time.time() < self._blocked_until:
+            return False
+
         oldest = self._get_oldest_file()
         if not oldest:
             return False
@@ -770,8 +813,24 @@ class Uploader:
                 # the server answered, so the transport is working again.
                 self._link_failures = 0
             if result == 'ok':
+                self._blocked_backoff = BLOCKED_BACKOFF_START
                 self._move_to_uploaded(oldest, sidecar)
                 return True
+            if result == 'blocked':
+                # Nothing will get through until an operator fixes the endpoint, so stop
+                # spending 2G data on it. The image stays in the outbox — this is an outage,
+                # not a bad capture, and parking the queue into failed/ would misattribute it.
+                self._blocked_until   = time.time() + self._blocked_backoff
+                logger.error(
+                    f"Endpoint is refusing uploads ({oldest.name} stays queued). Pausing "
+                    f"uploads for {self._blocked_backoff}s. Check the upload token and, if a "
+                    f"tunnel fronts the server, that it is still serving."
+                )
+                self._blocked_backoff = min(self._blocked_backoff * 2, BLOCKED_BACKOFF_MAX)
+                return False
+            if result == 'reject':
+                self._park_failed(oldest, sidecar, f"server rejected it (HTTP 4xx)")
+                return False
             if result == 'toobig':
                 # Never fits — park it (kept for re-send) instead of wasting retries or, worse,
                 # dropping it into uploaded/ where it would look delivered.

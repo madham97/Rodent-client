@@ -100,9 +100,10 @@ Key settings:
 
 **Upload**
 - `server_url` — server address (e.g. `http://192.168.1.10:8000` or an ngrok URL)
+- `upload_token` — shared secret the server checks on `/upload`; must match `UPLOAD_TOKEN` in the server's environment. Sent as a multipart field rather than a header, because the SIM800 only sets custom headers through `AT+HTTPPARA="USERDATA"`, whose behaviour varies by firmware. Leave `""` only if the server also has no token set — a mismatch returns `401` and pauses uploads
 - `webp_compress` / `webp_quality` — re-encode JPEGs as WebP before upload to reduce transfer size
 - `poll_interval` — seconds between outbox checks (default 10)
-- `max_retries` / `retry_delay` — upload retry behaviour
+- `max_retries` / `retry_delay` — upload retry behaviour. These apply only to failures a retry could plausibly fix. A status saying the endpoint is refusing *everything* (401, 402, 403, 407, 429, 451 — a wrong token, or a tunnel edge that has stopped forwarding, e.g. ngrok answering 403 once its bandwidth quota is spent) instead pauses uploads with an exponential backoff from 60 s to 1 h, leaving images queued in the outbox. Retrying those costs a full ~120 KB POST each and cannot succeed. A status rejecting the *specific* image (400, 413, 415, 422) parks it in `failed/` immediately rather than resending identical bytes
 - `http_action_timeout` — **ceiling** on waiting for the modem's upload verdict (default 180), not a fixed wait. The uploader polls `AT+HTTPSTATUS` and keeps waiting only while bytes are still moving, so a slow-but-healthy transfer runs to completion while a stuck one is abandoned in ~25 s. Raise it only if a legitimate upload is being cut off — a 290 KB payload at 2 KB/s needs over two minutes
 - `http_action_idle_polls` — consecutive checks showing no progress before an upload is declared stuck (default 3, ~8 s apart)
 - `confirm_path` — path used to ask the server whether an image already arrived, after a stall swallowed the modem's reply (default `/annotate/specific/{name}`, where `{name}` is the name the server files it under — `<stem>.jpg` when `webp_compress` is on). Prevents re-sending an image that was in fact delivered; set to `""` to disable
@@ -315,6 +316,7 @@ Full wiring, config, and installation instructions: [`docs/thermal-camera-setup.
 | Uploader exits immediately | Check `gsm_device` in config (`/dev/serial0` for GPIO, `/dev/ttyUSB0` for USB); verify SIM PIN |
 | Images not appearing on server | Check `server_url` in config; verify server is reachable (`curl <url>/health`) |
 | `/outbox` growing, nothing uploaded | Check GSM signal in dashboard; check uploader logs |
+| Log repeats `Endpoint is refusing uploads ... Pausing uploads` | The server or the tunnel in front of it answered 401/403/429. Check `upload_token` against the server's `UPLOAD_TOKEN`, and that the tunnel is still serving (`curl <server_url>/health`). Images stay queued and resume on their own within an hour of the endpoint recovering |
 | Log repeats `Modem link fault ... (+HTTPSTATUS: POST,0,0,0)` | The modem gave no verdict for the upload. `POST,0,0,0` only means the HTTP engine is **idle** — it does *not* mean the upload failed, and the POST has often already been delivered. Usually a USB endpoint stall (`dmesg \| grep -c 'urb stopped'`); work the physical layer first. Images stay queued and delivery is confirmed against the server before any re-send. See [`docs/gsm-hat-setup.md`](docs/gsm-hat-setup.md#telling-a-dead-data-path-apart-from-a-dead-modem) |
 | Log repeats `Serial read path is dead (USB endpoint stalled)` | A GPRS data attempt halted the CP2102 bulk-IN endpoint (`dmesg \| grep 'urb stopped'`); the uploader re-opens the port itself. Frequent stalls with uploads otherwise working are worth reporting, not fatal |
 | Motion not triggering | Lower `motion_threshold` or enable `motion_debug` to see live ratios |
