@@ -185,10 +185,15 @@ echo "Serial port freed for GSM modem."
 
 # ── Systemd services ───────────────────────────────────────────────────────────
 for svc in monitoring-pipeline-uploader monitoring-pipeline-recorder \
-           monitoring-pipeline-webui; do
+           monitoring-pipeline-webui monitoring-pipeline-update-watchdog; do
     cp "$SCRIPT_DIR/systemd/$svc.service" /etc/systemd/system/
 done
+# The watchdog is a timer, and it is installed and enabled even when self-update is off. It does
+# nothing unless an update is on probation, and having it already running is what makes enabling
+# self-update later a config change rather than a site visit.
+cp "$SCRIPT_DIR/systemd/monitoring-pipeline-update-watchdog.timer" /etc/systemd/system/
 systemctl daemon-reload
+systemctl enable --now monitoring-pipeline-update-watchdog.timer 2>/dev/null || true
 echo "Systemd services installed."
 
 # ── Enable and start ───────────────────────────────────────────────────────────

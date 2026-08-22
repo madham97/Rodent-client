@@ -225,6 +225,27 @@ check('_parse_httpstatus reads the latest sample',
       == (2, 800))
 check('_parse_httpstatus ignores junk', SIM800._parse_httpstatus('no status here') is None)
 
+# ── Reading a response body (the update channel's only way in) ────────────────
+
+check('_parse_httpaction reads status and length',
+      SIM800._parse_httpaction('\r\n+HTTPACTION: 0,200,4096\r\n') == (200, 4096))
+check('_parse_httpaction reports a non-200 with its length',
+      SIM800._parse_httpaction('+HTTPACTION: 0,404,0') == (404, 0))
+check('_parse_httpaction ignores junk', SIM800._parse_httpaction('nothing here') == (None, 0))
+
+check('_extract_httpread takes exactly the declared length',
+      SIM800._extract_httpread('+HTTPREAD: 5\r\nABCDEFGHIJ\r\nOK\r\n') == 'ABCDE')
+# A base64 bundle can contain any of these by chance, and a 2G link interleaves unsolicited
+# status messages into the same stream — so the declared length is the only safe delimiter.
+check('_extract_httpread is not fooled by OK inside the payload',
+      SIM800._extract_httpread('+HTTPREAD: 8\r\nAAOKAABB\r\nOK\r\n') == 'AAOKAABB')
+check('_extract_httpread is not fooled by a newline inside the payload',
+      SIM800._extract_httpread('+HTTPREAD: 6\r\nAB\nCDE\r\nOK\r\n') == 'AB\nCDE')
+check('_extract_httpread returns nothing when the header is missing',
+      SIM800._extract_httpread('OK\r\n') == '')
+check('_extract_httpread returns nothing when the length is unparseable',
+      SIM800._extract_httpread('+HTTPREAD: ?\r\ndata\r\nOK\r\n') == '')
+
 
 # ── Queue behaviour ───────────────────────────────────────────────────────────
 

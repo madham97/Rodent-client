@@ -601,6 +601,84 @@ class SIM800:
                 pass
         raise ModemLinkError("no +HTTPACTION result for confirmation GET")
 
+    def http_get_body(self, url: str, max_bytes: int = 512_000, chunk: int = 1024) -> 'tuple[int, str]':
+        """GET url and return (status_code, body_text).
+
+        The bodyless `http_get` above only learns the status; this also pulls the payload back
+        over the serial link with `AT+HTTPREAD`, which is how the device fetches anything from
+        the server rather than only pushing to it.
+
+        Read in chunks with an explicit offset, not one big read: the modem's HTTP buffer and
+        the UART both have limits well under a payload of interest, and a ranged read that
+        returns short is recoverable where a single oversized one just truncates silently.
+
+        The body is expected to be ASCII (the update channel base64-encodes for exactly this
+        reason) — bytes are decoded leniently, since a stray non-ASCII byte on a noisy 2G serial
+        line should corrupt one character rather than raise."""
+        self._send('AT+HTTPTERM', wait=1)
+        if 'OK' not in self._send('AT+HTTPINIT', wait=1):
+            raise ModemLinkError("HTTPINIT failed for GET")
+        for para in ('AT+HTTPPARA="CID",1', f'AT+HTTPPARA="URL","{url}"'):
+            if 'OK' not in self._send(para):
+                raise ModemLinkError(f"{para.split('=')[0]} rejected for GET")
+
+        self._send('AT+HTTPACTION=0', wait=0.5, heal=False)
+        result = self._wait_for('+HTTPACTION:', timeout=max(30, self.action_timeout // 2))
+        time.sleep(0.5)
+        result += self._ser.read(self._ser.in_waiting or 0).decode('ascii', errors='ignore')
+
+        status, length = self._parse_httpaction(result)
+        if status is None:
+            self._send('AT+HTTPTERM', wait=0.5)
+            raise ModemLinkError("no +HTTPACTION result for GET")
+
+        body = ''
+        if status == 200 and length:
+            remaining = min(length, max_bytes)
+            offset = 0
+            while remaining > 0:
+                want = min(chunk, remaining)
+                self._send(f'AT+HTTPREAD={offset},{want}', wait=0.3, heal=False)
+                raw = self._wait_for('OK', timeout=30)
+                piece = self._extract_httpread(raw)
+                if not piece:
+                    self._send('AT+HTTPTERM', wait=0.5)
+                    raise ModemLinkError(f"HTTPREAD returned nothing at offset {offset}")
+                body += piece
+                offset += len(piece)
+                remaining -= len(piece)
+
+        self._send('AT+HTTPTERM', wait=0.5)
+        return status, body
+
+    @staticmethod
+    def _parse_httpaction(text: str) -> 'tuple[int | None, int]':
+        """(status, content_length) from a '+HTTPACTION: <method>,<status>,<len>' line."""
+        if '+HTTPACTION:' not in text:
+            return None, 0
+        try:
+            fields = text.split('+HTTPACTION:')[1].strip().split(',')
+            return int(fields[1]), int(fields[2].split()[0])
+        except Exception:
+            return None, 0
+
+    @staticmethod
+    def _extract_httpread(text: str) -> str:
+        """Payload from a '+HTTPREAD: <n>\\r\\n<data>\\r\\nOK' reply.
+
+        Takes exactly the <n> characters the modem declared rather than everything up to OK:
+        the payload can itself contain a line that looks like a terminator, and on this link
+        unsolicited status messages (`+CSQ`, SMS notifications) can arrive mid-read."""
+        if '+HTTPREAD:' not in text:
+            return ''
+        head, _, rest = text.partition('+HTTPREAD:')
+        declared, _, payload = rest.partition('\n')
+        try:
+            n = int(declared.strip())
+        except ValueError:
+            return ''
+        return payload.lstrip('\r')[:n]
+
     def http_post(self, url: str, body: bytes, content_type: str) -> int:
         """
         POST body to url using the modem's internal HTTP stack.
@@ -697,6 +775,27 @@ class Uploader:
         self.retry_delay   = int(config.get('retry_delay', 60))
         self.poll_interval = int(config.get('poll_interval', 10))
 
+        # Self-update, on by default. The device has no inbound path at all, so without this the
+        # only way to change its code is a site visit. The safety is not in withholding the
+        # feature but in the probation/rollback contract around it: an update that cannot show a
+        # completed upload is reverted automatically (see updater.py).
+        self.updater = None
+        self._last_update_check = 0.0
+        self.update_check_interval = int(config.get('update_check_interval', 6 * 3600))
+        if config.get('update_enabled', True):
+            from updater import Updater, DEFAULT_MAX_PROBATION_S, DEFAULT_PROBATION_S
+            self.updater = Updater(
+                install_dir=Path(config.get('install_dir', '/opt/Rodent-client')),
+                server_url=self.server_url,
+                device_id=config.get('device_id', ''),
+                probation_s=int(config.get('update_probation_s', DEFAULT_PROBATION_S)),
+                max_probation_s=int(config.get('update_max_probation_s', DEFAULT_MAX_PROBATION_S)),
+            )
+            logger.info(f"Self-update enabled (checks every {self.update_check_interval // 3600}h, "
+                        f"current version {self.updater.current_version() or 'unknown'})")
+        else:
+            logger.warning("Self-update disabled — new code will need physical access to install")
+
         self.outbox_dir.mkdir(parents=True, exist_ok=True)
         self.uploaded_dir.mkdir(parents=True, exist_ok=True)
         self.failed_dir.mkdir(parents=True, exist_ok=True)
@@ -788,6 +887,15 @@ class Uploader:
         if status == 200:
             elapsed = time.time() - t0
             logger.info(f"Upload successful: {file_path.name} ({elapsed:.1f}s, {size / elapsed / 1024:.1f} KB/s)")
+            # A completed upload is the evidence that promotes a staged update out of probation.
+            # It is checked here rather than anywhere earlier because this is the first moment
+            # the entire chain — capture, disk, modem, bearer, server — is known to still work
+            # on the new code. Never allowed to disturb the upload result.
+            if self.updater:
+                try:
+                    self.updater.note_successful_upload()
+                except Exception:
+                    logger.exception('Could not record update confirmation')
             return 'ok'
 
         logger.warning(f"Upload failed (HTTP {status}): {file_path.name}")
@@ -1026,6 +1134,22 @@ class Uploader:
         except Exception as e:
             logger.error(f"SMS check error: {e}")
 
+    def _maybe_update(self) -> None:
+        """Check for a published update, at most once per `update_check_interval`.
+
+        Deliberately does not report an installed update back to the caller: `activate` restarts
+        this very process, so nothing after it in the loop is guaranteed to run."""
+        if not self.updater:
+            return
+        now = time.time()
+        if now - self._last_update_check < self.update_check_interval:
+            return
+        self._last_update_check = now
+        try:
+            self.updater.poll(self.modem)
+        except Exception:
+            logger.exception('Update check failed — continuing to upload normally')
+
     def run(self):
         self.modem.open()
         try:
@@ -1044,6 +1168,11 @@ class Uploader:
                     self._recover_link()
                 else:
                     self._check_sms()
+                    # Only with the queue drained and the link healthy. An update check costs a
+                    # round trip and a download costs ~20s of a link that moves ~1.8KB/s, so it
+                    # must never come at the expense of a backlog of captures.
+                    if not processed:
+                        self._maybe_update()
                 time.sleep(2 if processed else self.poll_interval)
 
         except KeyboardInterrupt:

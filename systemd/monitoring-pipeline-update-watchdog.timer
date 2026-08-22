@@ -1,0 +1,13 @@
+[Unit]
+Description=Monitoring Pipeline - periodic check for an unconfirmed client update
+
+[Timer]
+# Every 15 minutes, and shortly after boot — a device that is crash-looping on a bad update may
+# be rebooting repeatedly, and Persistent=true means a missed run fires on the next boot rather
+# than being skipped.
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

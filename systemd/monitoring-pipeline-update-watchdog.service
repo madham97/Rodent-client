@@ -1,0 +1,12 @@
+[Unit]
+Description=Monitoring Pipeline - roll back an unconfirmed client update
+# Intentionally depends on nothing. This has to run when the recorder and uploader are
+# crash-looping on a bad update, which is the only situation it exists for.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/Rodent-client/scripts/update-watchdog.py --install-dir /opt/Rodent-client
+# The system python, not the venv: a broken update could leave the venv unusable, and the
+# watchdog uses nothing outside the standard library.
+StandardOutput=journal
+StandardError=journal

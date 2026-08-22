@@ -71,6 +71,7 @@ Three core systemd services are installed under the name prefix `monitoring-pipe
 | `recorder` | Captures images to `/outbox` |
 | `uploader` | Uploads images from `/outbox` to the server via GSM; manages its own GPRS bearer via AT commands |
 | `webui` | Local dashboard at `http://<pi-ip>:8080` |
+| `update-watchdog` | Timer (every 15 min). Rolls back a pulled update that never completed an upload — see [Remote code updates](#remote-code-updates) |
 
 Two additional service unit files exist in `systemd/` but are not installed by `install.sh`:
 
@@ -145,6 +146,53 @@ Restart the relevant service after any change:
 sudo systemctl restart monitoring-pipeline-recorder  # after recording changes
 sudo systemctl restart monitoring-pipeline-uploader  # after upload/GSM changes
 ```
+
+## Remote code updates
+
+The device can pull new code over the same GSM link it uploads on. This exists because there is no other way in: the SIM800 is driven by AT commands, so the Pi has no IP stack on that link — no SSH, and no usable Tailscale (it needs a real interface, and over ~1.8 KB/s GPRS an interactive session is unusable even when a PPP link is up). The device can only ever pull.
+
+**On by default.** Set `update_enabled: false` to opt out, accepting that new code then needs physical access. The safety here is not in withholding the feature — it is in the probation contract below, which reverts anything that cannot prove it still reaches the server.
+
+**Publishing an update**
+
+```bash
+scripts/build-update-bundle.sh /path/to/Server/client_updates
+```
+
+That compile-checks the sources, runs the offline tests, and writes a timestamped `.tgz`. The server serves the newest bundle in that directory, so **removing a bundle rolls the fleet back to the one before it**. A full bundle is ~52 KB, about 38 s of transfer.
+
+**What happens on the device**
+
+1. The uploader checks the manifest every `update_check_interval` (default 6 h) — but only when the outbox is empty and the link is healthy, so an update never competes with a backlog of captures.
+2. A new version is downloaded, its **sha256 verified**, and its Python **compile-checked** before anything is installed. A bundle failing either is discarded and the device stays where it is.
+3. The files it replaces are snapshotted, the new ones copied in, and the services restarted. The update is now on **probation**.
+4. Probation ends when the device **completes a real upload**. Not when a process starts — an upload, because losing the uplink is the only failure that can't be fixed remotely, so the uplink is what has to be proven.
+5. If no upload succeeds within `update_probation_s` (default 6 h), `monitoring-pipeline-update-watchdog.timer` restores the snapshot and restarts the services.
+
+Two refinements keep that from misfiring:
+
+- **An empty outbox defers the rollback.** Nothing queued means nothing needed uploading, so the absence of an upload is not evidence against the new code. This deployment is near-silent overnight, and a fixed timer would revert good updates every night. Deferral is capped at `update_max_probation_s` (24 h), because a broken *recorder* would keep the outbox empty forever too.
+- **A rolled-back version isn't retried for 24 h.** Otherwise the device reinstalls exactly what it just rejected on the next check and loops, spending a bundle's worth of metered 2G each time. Publishing a *different* version clears the block immediately, so a fix is never held up by the failure before it.
+
+The watchdog is a separate systemd timer running under the system Python. It is **self-contained** — standard library only, importing nothing from `pi-client` — so it still works when the tree an update just replaced is broken. That independence costs some duplication with `updater.py`; the shared contract is the on-disk `update_state.json`, not the code. It is installed and enabled even when self-update is off.
+
+**Settings**
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `update_enabled` | `true` | Pull and install published updates |
+| `update_check_interval` | `21600` | Seconds between manifest checks (6 h) |
+| `update_probation_s` | `21600` | Seconds a new version has to complete one upload (6 h) |
+| `update_max_probation_s` | `86400` | Cap on deferring rollback while the outbox is empty (24 h) |
+| `install_dir` | `/opt/Rodent-client` | Tree the bundle is extracted over |
+
+Current state lives in `update_state.json` (`idle` / `probation` / `confirmed` / `rolled_back`). Check a device by hand with:
+
+```bash
+python3 scripts/update-watchdog.py --dry-run    # exit 1 = would roll back
+```
+
+Config (`client.json`), the venv and the image queues are never in a bundle — a rollback must not take the SIM PIN and server URL with it.
 
 ## Remote config via SMS
 
