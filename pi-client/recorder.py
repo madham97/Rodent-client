@@ -542,6 +542,16 @@ class Recorder:
             meta['thermal_min_c'] = round(tmin, 1)
             meta['thermal_max_c'] = round(tmax, 1)
             meta['thermal_avg_c'] = round(tavg, 1)
+            # The window the pixel values were actually encoded against — NOT the observed range
+            # above, which is telemetry only. Without these two, decoding a stored frame back to
+            # °C means *assuming* whatever thermal_norm_min_c/thermal_norm_max_c happened to be
+            # configured at capture time (see frame_to_gray8), so changing that config would
+            # silently invalidate the decode for every frame after the change with nothing in the
+            # data to distinguish old from new. Recorded per-frame instead, the archive stays
+            # self-describing across any future retune.
+            if self._thermal is not None:
+                meta['thermal_norm_min_c'] = self._thermal.norm_min_c
+                meta['thermal_norm_max_c'] = self._thermal.norm_max_c
         if thermal_skew_ms is not None:
             # Recorded so sync is auditable from the uploaded data alone: how far apart in time the
             # two fused frames actually were, signed (+ = thermal newer than visible).

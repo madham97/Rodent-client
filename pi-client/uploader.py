@@ -213,7 +213,8 @@ def build_multipart(file_path: Path, metadata: dict = None, webp_compress: bool 
 
     body = b''
     always_keys    = ('device_id', 'mode', 'motion_score', 'timestamp')
-    optional_keys  = ('format', 'thermal_min_c', 'thermal_max_c', 'thermal_avg_c', 'token')
+    optional_keys  = ('format', 'thermal_min_c', 'thermal_max_c', 'thermal_avg_c',
+                      'thermal_norm_min_c', 'thermal_norm_max_c', 'token')
     for key in always_keys + tuple(k for k in optional_keys if k in metadata):
         value = str(metadata.get(key, ''))
         body += (
