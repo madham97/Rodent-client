@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 
 STOP_FLAG = False
 
+# Suffix for the sensor-resolution thermal frame written next to a capture under native
+# transport. The uploader matches on it to bundle the pair into one POST and to keep the thermal
+# file from being picked up and sent as if it were a capture of its own.
+THERMAL_SUFFIX = '_thermal.png'
+
 # Software rotation applied to buffered frames, correcting for how the CSI camera is physically
 # mounted. Populated lazily so importing this module never requires cv2.
 _CV_ROTATE = {}
@@ -101,6 +106,9 @@ class ThermalStream:
         self.fps           = fps
         self.filters       = filters
         self.offset        = offset
+        # Accepted for config compatibility, but no longer the buffer's resolution: frames are
+        # kept at the sensor's own size (see _run). Still honoured by the standalone
+        # thermal/record_combined.py, which composes a fixed-size side-by-side video.
         self.out_size      = (out_width, out_height)
         self.warmup_frames = warmup_frames
         self.spi_speed_hz  = spi_speed_hz
@@ -199,7 +207,12 @@ class ThermalStream:
         while not self._stop_event.is_set():
             try:
                 data, _ = read_frame(self._mi48, cs_pin)
-                gray8, stats = frame_to_gray8(data, self._mi48.fpa_shape, out_size=self.out_size,
+                # Buffered at the sensor's own resolution. Every consumer either writes the frame
+                # out natively or scales it straight to the visible frame's size, so enlarging
+                # here would only insert an extra resampling step on the way to both — and to a
+                # size (`out_size`) that nothing actually wants.
+                rows, cols = self._mi48.fpa_shape
+                gray8, stats = frame_to_gray8(data, self._mi48.fpa_shape, out_size=(cols, rows),
                                                hflip=self.hflip, vflip=self.vflip,
                                                rotation=self.rotation,
                                                norm_min_c=self.norm_min_c, norm_max_c=self.norm_max_c)
@@ -423,6 +436,11 @@ class Recorder:
 
         # Thermal fusion (Waveshare MI48, GPIO/SPI/I2C)
         self.thermal_enabled = bool(config.get('thermal_enabled', False))
+        # Send the thermal frame at the sensor's own resolution as its own part of the upload,
+        # instead of stretching it into the visible frame's alpha channel. Off restores the
+        # previous RGBA behaviour — worth keeping reachable, since it's the only way back if a
+        # server ever can't accept the second part, and this device is reconfigurable by SMS.
+        self.thermal_native_transport = bool(config.get('thermal_native_transport', True))
         thermal_fps = int(config.get('thermal_fps', 9))
 
         # Maximum tolerated gap between the visible exposure and the thermal frame fused with it.
@@ -646,13 +664,58 @@ class Recorder:
             # extension — pass it explicitly.
             out.save(jpg_path, format='JPEG', quality=self.image_quality)
 
-    def _fuse_thermal(self, visible_path: Path, exposure_ts: float):
+    def _save_with_thermal(self, visible, stem: Path, gray8, stats, skew_ms: int,
+                            motion_score: float, visible_tmp: Path | None = None) -> Path:
+        """Write a capture that has a thermal frame, by whichever transport is configured.
+
+        Native transport keeps the thermal frame on the sensor's own 80x62 grid as its own file
+        next to the JPEG, and the uploader sends both in one POST. The legacy alternative
+        stretches it to the visible frame's size and hides it in an alpha channel, because WebP
+        alpha has to match the image dimensions — which costs ~40KB per capture over the modem
+        to carry ~1.8KB of actual measurements, all of it interpolation.
+
+        The thermal file is written *before* the visible frame is renamed into place: the
+        uploader publishes on that rename, so writing in this order means it can never observe a
+        capture whose thermal half hasn't landed yet.
+
+        `visible_tmp` is an already-encoded JPEG on disk (the rpicam-still path captures straight
+        to one). When given, native transport renames that file rather than re-encoding `visible`,
+        which would be a second lossy pass over the same pixels for no gain."""
+        from PIL import Image
+        if not self.thermal_native_transport:
+            alpha = Image.fromarray(gray8, mode='L').resize(visible.size, Image.BICUBIC)
+            fused = visible.copy()
+            fused.putalpha(alpha)
+            final_path = stem.with_suffix('.png')
+            tmp = final_path.with_suffix('.png.tmp')
+            fused.save(tmp, format='PNG', compress_level=1)
+            self._write_sidecar(final_path, motion_score=motion_score,
+                                 fmt='rgba_thermal_alpha', thermal_stats=stats,
+                                 thermal_skew_ms=skew_ms)
+            tmp.rename(final_path)
+            return final_path
+
+        final_path = stem.with_suffix('.jpg')
+        tmp = visible_tmp
+        if tmp is None:
+            tmp = final_path.with_suffix('.jpg.tmp')
+            visible.save(tmp, format='JPEG', quality=self.image_quality)
+        Image.fromarray(gray8, mode='L').save(
+            stem.with_name(stem.name + THERMAL_SUFFIX), format='PNG', optimize=True)
+        self._write_sidecar(final_path, motion_score=motion_score, fmt='rgb+thermal_native',
+                             thermal_stats=stats, thermal_skew_ms=skew_ms)
+        tmp.rename(final_path)
+        return final_path
+
+    def _thermal_partner(self, visible_path: Path, exposure_ts: float):
         """
-        Combine the visible JPEG with the latest buffered thermal frame into an RGBA image,
-        with the normalized thermal frame stored as the alpha channel. Returns
-        (PIL.Image, (temp_min_c, temp_max_c, temp_avg_c), skew_ms), or None if thermal isn't
-        usable — not ready yet (still warming up, or the sensor failed to init), or the newest
-        frame is too far from `exposure_ts` to honestly belong to the same moment.
+        Pick the buffered thermal frame that belongs to this exposure. Returns
+        (PIL.Image visible, gray8, (temp_min_c, temp_max_c, temp_avg_c), skew_ms), or None if
+        thermal isn't usable — not ready yet (still warming up, or the sensor failed to init), or
+        the newest frame is too far from `exposure_ts` to honestly belong to the same moment.
+
+        Deliberately does not combine the two: how they are stored is `_save_with_thermal`'s
+        decision, and under native transport they are never combined at all.
         """
         nearest = self._thermal.nearest(exposure_ts)
         if nearest is None:
@@ -670,10 +733,7 @@ class Recorder:
 
         from PIL import Image
         visible = Image.open(visible_path).convert('RGB')
-        alpha = Image.fromarray(gray8, mode='L').resize(visible.size, Image.BICUBIC)
-        fused = visible.copy()
-        fused.putalpha(alpha)
-        return fused, stats, round(skew * 1000)
+        return visible, gray8, stats, round(skew * 1000)
 
     def _select_pair(self, around_ts: float, search_s: float = 0.5):
         """Pick the best-synchronised (visible, thermal) pair from the two ring buffers.
@@ -779,15 +839,8 @@ class Recorder:
         stem = self.outbox_dir / self._make_filename_stem(vis_ts)
         if thermal is not None:
             _th_ts, gray8, stats = thermal
-            alpha = Image.fromarray(gray8, mode='L').resize(visible.size, Image.BICUBIC)
-            visible.putalpha(alpha)
-            final_path = stem.with_suffix('.png')
-            tmp = final_path.with_suffix('.png.tmp')
-            visible.save(tmp, format='PNG', compress_level=1)
-            self._write_sidecar(final_path, motion_score=motion_score,
-                                 fmt='rgba_thermal_alpha', thermal_stats=stats,
-                                 thermal_skew_ms=round(skew * 1000))
-            tmp.rename(final_path)
+            final_path = self._save_with_thermal(visible, stem, gray8, stats,
+                                                  round(skew * 1000), motion_score)
             logger.info(
                 f"Captured fused image: {final_path.name} (skew {round(skew * 1000):+d}ms, "
                 f"trigger lag {(vis_ts - at_ts) * 1000:+.0f}ms)"
@@ -822,7 +875,7 @@ class Recorder:
             return
         jpg_tmp, exposure_ts = captured
 
-        fused = self._fuse_thermal(jpg_tmp, exposure_ts) if self._thermal else None
+        fused = self._thermal_partner(jpg_tmp, exposure_ts) if self._thermal else None
 
         # With thermal fusion on, a visible frame with no properly-timed thermal counterpart is
         # discarded rather than saved as a plain JPEG: an unpaired or mistimed frame is unusable
@@ -838,20 +891,13 @@ class Recorder:
             return
 
         if fused:
-            image, stats, skew_ms = fused
-            final_path = stem.with_suffix('.png')
-            png_tmp = final_path.with_suffix('.png.tmp')
-            # compress_level=1, not PIL's default 6: at 1920x1080 RGBA the default costs ~1.45s of
-            # CPU per capture, during which the detection loop is blocked and motion is missed.
-            # Level 1 is ~8x faster for ~17% more bytes on disk, and those bytes are transient —
-            # the uploader re-encodes every file to WebP before transmission anyway, so the extra
-            # size never reaches the network.
-            image.save(png_tmp, format='PNG', compress_level=1)
-            jpg_tmp.unlink(missing_ok=True)
-            self._write_sidecar(final_path, motion_score=motion_score,
-                                 fmt='rgba_thermal_alpha', thermal_stats=stats,
-                                 thermal_skew_ms=skew_ms)
-            png_tmp.rename(final_path)
+            visible, gray8, stats, skew_ms = fused
+            final_path = self._save_with_thermal(visible, stem, gray8, stats, skew_ms,
+                                                  motion_score, visible_tmp=jpg_tmp)
+            # Native transport renames jpg_tmp into place; the legacy path writes its own PNG and
+            # leaves the JPEG behind.
+            if final_path.suffix != '.jpg':
+                jpg_tmp.unlink(missing_ok=True)
             logger.info(f"Captured fused image: {final_path.name} (skew {skew_ms:+d}ms)")
         else:
             final_path = stem.with_suffix('.jpg')
@@ -1014,6 +1060,7 @@ def load_config(path: str = None) -> dict:
         'image_hflip':        False,
         'image_vflip':        False,
         'thermal_enabled':       False,
+        'thermal_native_transport': True,
         'thermal_fps':           9,
         'thermal_filters':       True,
         'thermal_offset':        0.0,

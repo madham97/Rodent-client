@@ -43,6 +43,10 @@ REJECT_STATUSES  = {400, 413, 415, 422}
 BLOCKED_BACKOFF_START = 60
 BLOCKED_BACKOFF_MAX   = 3600
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
+# Sensor-resolution thermal frame written alongside a capture under native transport. Kept in
+# step with recorder.THERMAL_SUFFIX, but defined here rather than imported: the uploader runs as
+# its own process and importing the recorder would drag in the camera and sensor stack with it.
+THERMAL_SUFFIX = '_thermal.png'
 
 
 class ModemLinkError(Exception):
@@ -196,9 +200,20 @@ def _to_webp(file_path: Path, quality: int, max_bytes: int = None) -> tuple[byte
         return data, name
 
 
+def thermal_part_for(file_path: Path) -> Path | None:
+    """The sensor-resolution thermal frame belonging to this capture, if native transport wrote
+    one. Named from the capture's stem, so the pairing needs no index or timestamp match."""
+    candidate = file_path.with_name(file_path.stem + THERMAL_SUFFIX)
+    return candidate if candidate.exists() else None
+
+
 def build_multipart(file_path: Path, metadata: dict = None, webp_compress: bool = False,
                     webp_quality: int = 80, max_image_bytes: int = None) -> bytes:
-    """Wrap image file in a multipart/form-data body with metadata text fields."""
+    """Wrap image file in a multipart/form-data body with metadata text fields.
+
+    A capture with a native thermal frame gets it as a second file part in the same body, so the
+    pair arrives in one request and cannot be split or mismatched in transit — the property the
+    old alpha-channel fusion was really buying, kept without paying for the interpolation."""
     if metadata is None:
         metadata = {}
 
@@ -231,6 +246,20 @@ def build_multipart(file_path: Path, metadata: dict = None, webp_compress: bool 
         f'\r\n'
     ).encode()
     body += data
+
+    thermal_path = thermal_part_for(file_path)
+    if thermal_path:
+        # Sent as stored: a PNG of the 80x62 sensor grid, ~1.8KB. Not re-encoded to WebP — at
+        # this size the container overhead would outweigh anything the codec saves, and the
+        # frame is measurement data, so a lossy pass over it is not a trade worth making.
+        body += (
+            f'\r\n--{BOUNDARY}\r\n'
+            f'Content-Disposition: form-data; name="thermal"; filename="{thermal_path.name}"\r\n'
+            f'Content-Type: image/png\r\n'
+            f'\r\n'
+        ).encode()
+        body += thermal_path.read_bytes()
+
     body += f'\r\n--{BOUNDARY}--\r\n'.encode()
     return body
 
@@ -711,6 +740,10 @@ class Uploader:
                 p for p in self.outbox_dir.glob('*')
                 if p.is_file()
                 and not p.name.endswith('.tmp')
+                # A capture's thermal half is not a capture. It rides along with its visible
+                # frame in one POST (see _thermal_part_for); left in this list it would also be
+                # uploaded on its own as though it were a photo.
+                and not p.name.endswith(THERMAL_SUFFIX)
                 and p.suffix.lower() in IMAGE_EXTS
                 and p.stat().st_size > 0
             ]
@@ -859,10 +892,15 @@ class Uploader:
 
     def _move_to_uploaded(self, image: Path, sidecar: Path):
         self._unconfirmed.discard(image.name)
+        thermal = thermal_part_for(image)
         try:
             shutil.move(str(image), str(self.uploaded_dir / image.name))
             logger.info(f"Moved to uploaded: {image.name}")
             sidecar.unlink(missing_ok=True)
+            # Already sent inside the same POST, so it has no further use — and it is excluded
+            # from the upload queue, so nothing else would ever clear it from the outbox.
+            if thermal:
+                thermal.unlink(missing_ok=True)
         except Exception as e:
             logger.error(f"Error moving {image.name}: {e}")
 
@@ -871,10 +909,14 @@ class Uploader:
         and out of the active queue so it never blocks the images behind it."""
         self._unconfirmed.discard(image.name)
         logger.error(f"Parking {image.name} in {self.failed_dir.name}/ ({reason})")
+        thermal = thermal_part_for(image)
         try:
             shutil.move(str(image), str(self.failed_dir / image.name))
             if sidecar.exists():
                 shutil.move(str(sidecar), str(self.failed_dir / sidecar.name))
+            # Parked together, so a later re-send still finds a complete capture.
+            if thermal:
+                shutil.move(str(thermal), str(self.failed_dir / thermal.name))
         except FileNotFoundError:
             pass  # already moved externally — nothing to do
         except Exception as e:
