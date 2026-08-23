@@ -20,25 +20,42 @@ cd "$REPO_DIR"
 # Refuse to ship code that does not import. The device compile-checks too, but failing here
 # costs seconds where failing there costs a probation window and a rollback.
 echo "Compile-checking sources..."
-python3 -m py_compile pi-client/*.py scripts/*.py
+python3 -m py_compile pi-client/*.py pi-client/thermal/*.py scripts/*.py
 
 echo "Running offline tests..."
 TEST_LOG="$(mktemp)"
-if ! ( cd pi-client && python3 test_updater.py && python3 test_thermal_geometry.py ) >"$TEST_LOG" 2>&1; then
-    echo "offline tests FAILED — not building:"
-    cat "$TEST_LOG"
-    rm -f "$TEST_LOG"
-    exit 1
-fi
+SKIPPED=""
+for t in test_updater.py test_thermal_geometry.py test_uploader_recovery.py; do
+    # `&& rc=0 || rc=$?` rather than a bare call: `set -e` aborts the script on the first
+    # non-zero exit, so a plain invocation never reaches the line that inspects the code —
+    # which silently turned "skipped" into "build stops here".
+    ( cd pi-client && python3 "$t" ) >"$TEST_LOG" 2>&1 && rc=0 || rc=$?
+    case $rc in
+        0)  echo "  $t: passed" ;;
+        # 77 means the test could not run here (optional deps absent), not that it failed.
+        # Reported loudly rather than swallowed: the gate genuinely did not cover this build.
+        77) echo "  $t: SKIPPED — $(tail -1 "$TEST_LOG")"; SKIPPED="$SKIPPED $t" ;;
+        *)  echo "  $t FAILED — not building:"; cat "$TEST_LOG"; rm -f "$TEST_LOG"; exit 1 ;;
+    esac
+done
 rm -f "$TEST_LOG"
+if [ -n "$SKIPPED" ]; then
+    echo ""
+    echo "WARNING: not all checks ran ($SKIPPED ). Install their deps to gate on them."
+fi
 
 mkdir -p "$OUT_DIR"
 BUNDLE="$OUT_DIR/$VERSION.tgz"
 
+# pi-client/thermal/ is a runtime dependency, not an optional extra: recorder.py puts it on
+# sys.path and imports thermal_common at startup. Omitting it shipped a bundle whose recorder
+# called a frame_to_gray8 that did not exist in the version on the device — which fails at
+# runtime, not at the compile check, and takes the thermal stream down with it.
 tar czf "$BUNDLE" \
     --exclude='__pycache__' \
     --exclude='*.pyc' \
     pi-client/*.py \
+    pi-client/thermal/*.py \
     scripts/update-watchdog.py
 
 SIZE=$(stat -c %s "$BUNDLE")

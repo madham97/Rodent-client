@@ -35,7 +35,12 @@ if 'serial' not in sys.modules:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from PIL import Image as PILImage
+try:
+    from PIL import Image as PILImage
+except ImportError as e:                      # pragma: no cover - environment-dependent
+    # Exit 77 = "could not run", reported separately from a failure by the build script.
+    print(f"SKIP  uploader recovery tests: {e}")
+    sys.exit(77)
 
 from uploader import SIM800, Uploader, ModemLinkError
 

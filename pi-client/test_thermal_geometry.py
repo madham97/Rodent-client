@@ -16,7 +16,13 @@ import sys
 import types
 from pathlib import Path
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError as e:                      # pragma: no cover - environment-dependent
+    # Exit 77 = "could not run", which the build script reports separately from a failure.
+    # A missing library must never be able to look like a pass on a gate this one guards.
+    print(f"SKIP  thermal geometry tests: {e}")
+    sys.exit(77)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'thermal'))
 
