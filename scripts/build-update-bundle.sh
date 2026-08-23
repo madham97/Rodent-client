@@ -24,8 +24,8 @@ python3 -m py_compile pi-client/*.py scripts/*.py
 
 echo "Running offline tests..."
 TEST_LOG="$(mktemp)"
-if ! ( cd pi-client && python3 test_updater.py ) >"$TEST_LOG" 2>&1; then
-    echo "test_updater.py FAILED — not building:"
+if ! ( cd pi-client && python3 test_updater.py && python3 test_thermal_geometry.py ) >"$TEST_LOG" 2>&1; then
+    echo "offline tests FAILED — not building:"
     cat "$TEST_LOG"
     rm -f "$TEST_LOG"
     exit 1

@@ -153,8 +153,10 @@ def frame_to_gray8(data, fpa_shape, out_size=(480, 372), hflip=False, vflip=Fals
     Parameters
     ----------
     data       : raw data from MI48.read()
-    fpa_shape  : mi48.fpa_shape  (rows, cols)
-    out_size   : (width, height) for the output image
+    fpa_shape  : mi48.fpa_shape, passed straight through to data_to_frame. Note its element
+                 order is (width, height) on this sensor, so do not unpack it to derive an
+                 output size — pass out_size=None and let the decoded frame speak for itself.
+    out_size   : (width, height) for the output image, or None to keep the sensor's own
     hflip, vflip : bool
         The MI48's row/column readout order doesn't necessarily match the CSI camera's —
         on at least one unit tested the thermal frame comes out horizontally mirrored
@@ -198,6 +200,13 @@ def frame_to_gray8(data, fpa_shape, out_size=(480, 372), hflip=False, vflip=Fals
     from senxor.utils import data_to_frame, cv_filter
 
     frame = data_to_frame(data, fpa_shape)
+    if out_size is None:
+        # Native resolution, measured off the decoded frame rather than derived from
+        # `fpa_shape`. The MI48 reports fpa_shape as (width, height) — (80, 62) — not the
+        # (rows, cols) this docstring used to claim, and unpacking it the documented way
+        # silently squashed every frame into a 62x80 portrait for a day. `frame.shape` is
+        # whatever data_to_frame actually produced, so it cannot disagree with itself.
+        out_size = (frame.shape[1], frame.shape[0])
     stats = (float(frame.min()), float(frame.max()), float(frame.mean()))
 
     scaled = (frame.astype('float32') - norm_min_c) * (255.0 / (norm_max_c - norm_min_c))
@@ -223,8 +232,10 @@ def frame_to_image(data, fpa_shape, out_size=(480, 372), colormap=None, hflip=Fa
     Parameters
     ----------
     data       : raw data from MI48.read()
-    fpa_shape  : mi48.fpa_shape  (rows, cols)
-    out_size   : (width, height) for the output image
+    fpa_shape  : mi48.fpa_shape, passed straight through to data_to_frame. Note its element
+                 order is (width, height) on this sensor, so do not unpack it to derive an
+                 output size — pass out_size=None and let the decoded frame speak for itself.
+    out_size   : (width, height) for the output image, or None to keep the sensor's own
     colormap   : cv2 colormap constant (default: cv2.COLORMAP_INFERNO)
     hflip, vflip, rotation, norm_min_c, norm_max_c : see frame_to_gray8
     """

@@ -211,8 +211,7 @@ class ThermalStream:
                 # out natively or scales it straight to the visible frame's size, so enlarging
                 # here would only insert an extra resampling step on the way to both — and to a
                 # size (`out_size`) that nothing actually wants.
-                rows, cols = self._mi48.fpa_shape
-                gray8, stats = frame_to_gray8(data, self._mi48.fpa_shape, out_size=(cols, rows),
+                gray8, stats = frame_to_gray8(data, self._mi48.fpa_shape, out_size=None,
                                                hflip=self.hflip, vflip=self.vflip,
                                                rotation=self.rotation,
                                                norm_min_c=self.norm_min_c, norm_max_c=self.norm_max_c)

@@ -24,10 +24,20 @@ coverage.xml
 # Local instance config (never commit — use config/client.json.template)
 config/client.json
 
-# Config backups (may contain secrets like the SIM PIN — never commit)
-config/client.json.live-backup
+# Config backups (may contain secrets like the SIM PIN — never commit).
+# Globbed on the prefix, not the extension: install.sh writes dated backups like
+# client.json.bak-20260823T141650, which "*.bak" does not match — that near-miss is how a
+# live gsm_pin and upload_token reached a public commit.
+config/client.json*
+# ...but the template is the one that must stay tracked. Without this negation the glob above
+# hides it, which only shows up the day someone recreates it and it silently won't stage.
+!config/client.json.template
 *.live-backup
-*.bak
+*.bak*
+
+# Per-device runtime state written by the updater — not source, and it would otherwise
+# produce a diff on every device that syncs.
+update_state.json
 
 # Web UI credentials (never commit)
 config/webui.env
