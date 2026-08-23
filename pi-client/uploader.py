@@ -638,8 +638,14 @@ class SIM800:
             offset = 0
             while remaining > 0:
                 want = min(chunk, remaining)
-                self._send(f'AT+HTTPREAD={offset},{want}', wait=0.3, heal=False)
-                raw = self._wait_for('OK', timeout=30)
+                # Keep what _send already drained. It sleeps `wait` and then empties the port,
+                # so for a small payload — the manifest is ~120 bytes, well under a UART-second —
+                # the whole reply through OK arrives inside that sleep and is returned here.
+                # Discarding it left _wait_for blocking on an empty buffer until its timeout,
+                # which failed every manifest check at offset 0.
+                raw = self._send(f'AT+HTTPREAD={offset},{want}', wait=0.3, heal=False)
+                if 'OK' not in raw:
+                    raw += self._wait_for('OK', timeout=30)
                 piece = self._extract_httpread(raw)
                 if not piece:
                     self._send('AT+HTTPTERM', wait=0.5)

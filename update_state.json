@@ -1,0 +1,6 @@
+{
+  "state": "confirmed",
+  "version": "20260822T125031Z",
+  "confirmed_at": 1787488718.581064,
+  "note": "Seeded during setup. Tree matches this bundle except for the local http_get_body fix in uploader.py. Prevents re-fetching a bundle that would revert that fix; rebuild and republish to supersede."
+}
