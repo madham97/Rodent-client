@@ -9,6 +9,7 @@ the SIM800's built-in AT+HTTP stack. No pppd required.
 import json
 import logging
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -25,6 +26,27 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Set by SIGTERM/SIGINT so the run loop can exit through its `finally` and close the GPRS bearer
+# and serial port. Without this, systemd's SIGTERM killed the process outright and left the
+# modem holding an open bearer — which is how a restart could strand the device off the air.
+STOP_FLAG = False
+
+
+def _signal_handler(signum, frame):
+    global STOP_FLAG
+    logger.info(f"Received signal {signum}, shutting down after the current operation...")
+    STOP_FLAG = True
+
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+# How often to ask the server whether a new bundle is published. A check is a ~120-byte manifest
+# GET, so a few seconds of a 1.8KB/s link — cheap enough to do often, and it only ever runs with
+# the outbox already drained, so it never competes with uploads. Short matters more than cheap
+# here: this interval is the floor on how long a bad release stays out in the field.
+DEFAULT_UPDATE_CHECK_S = 2 * 3600
 
 BOUNDARY = 'PiPipeline'
 MAX_FILE_BYTES = 300_000  # SIM800 internal HTTP buffer limit
@@ -65,14 +87,23 @@ _SMS_KEY_SPEC = {
     'mode':               ('recording', str,   True),
     'webp_compress':      (None,        bool,  False),
     'webp_quality':       (None,        int,   False),
+    # Both are re-read live by the uploader (see _reload_update_config), so an SMS takes effect
+    # on the next loop rather than needing a restart the device may not survive. `update_enabled`
+    # is the kill switch: it stops a device pulling anything further while an incident is open.
+    'update_check_interval': (None,     int,   False),
+    'update_enabled':        (None,     bool,  False),
 }
 
 
 class SMSConfigHandler:
     """Parse and apply config changes delivered via SMS."""
 
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, runtime=None):
         self._path = config_path
+        # Callable returning a dict of live facts. SMS is the only channel that does not need the
+        # GPRS bearer, so it is the one thing that can still answer when the device has gone quiet
+        # — but it used to reply with config echoed off disk, which says nothing about why.
+        self._runtime = runtime
 
     def handle(self, text: str) -> str:
         cmd = text.strip()
@@ -92,17 +123,21 @@ class SMSConfigHandler:
             f.write('\n')
 
     def _status(self) -> str:
+        """One SMS worth of the facts you actually want when a device stops reporting: is the
+        bearer up, is anything queued, when did an upload last succeed, and what is the update
+        doing. Kept terse to stay inside a single 160-character segment."""
+        parts = []
         try:
-            cfg = self._load()
-            rec = cfg.get('recording', {})
-            return (
-                f"mode={rec.get('mode', '?')} "
-                f"threshold={rec.get('motion_threshold', '?')} "
-                f"interval={rec.get('image_interval', '?')} "
-                f"quality={rec.get('image_quality', '?')}"
-            )
+            rec = self._load().get('recording', {})
+            parts.append(f"mode={rec.get('mode', '?')} thr={rec.get('motion_threshold', '?')}")
         except Exception as e:
-            return f'ERR: {e}'
+            parts.append(f'cfg-ERR:{e}')
+        if self._runtime:
+            try:
+                parts.append(self._runtime())
+            except Exception as e:
+                parts.append(f'rt-ERR:{type(e).__name__}')
+        return ' | '.join(parts)
 
     def _apply_set(self, args: str) -> str:
         pairs = {}
@@ -785,10 +820,19 @@ class Uploader:
         # only way to change its code is a site visit. The safety is not in withholding the
         # feature but in the probation/rollback contract around it: an update that cannot show a
         # completed upload is reverted automatically (see updater.py).
+        self._bearer_ok = False
+        self._bearer_attempts = 0
+        self._bearer_backoff = 15
+        self._bearer_retry_at = 0.0
+        self._last_upload_ok = 0.0
+
         self.updater = None
         self._last_update_check = 0.0
-        self.update_check_interval = int(config.get('update_check_interval', 6 * 3600))
-        if config.get('update_enabled', True):
+        self._config_path = Path(config.get('_config_path', '/opt/Rodent-client/config/client.json'))
+        self._config_mtime = 0.0
+        self.update_check_interval = int(config.get('update_check_interval', DEFAULT_UPDATE_CHECK_S))
+        self._update_enabled = bool(config.get('update_enabled', True))
+        if self._update_enabled:
             from updater import Updater, DEFAULT_MAX_PROBATION_S, DEFAULT_PROBATION_S
             self.updater = Updater(
                 install_dir=Path(config.get('install_dir', '/opt/Rodent-client')),
@@ -832,7 +876,8 @@ class Uploader:
         )
 
         self._sms_handler = SMSConfigHandler(
-            config.get('_config_path', '/opt/Rodent-client/config/client.json')
+            config.get('_config_path', '/opt/Rodent-client/config/client.json'),
+            runtime=self._runtime_summary,
         )
 
         logger.info(f"Uploader initialized. Upload URL: {self.upload_url}")
@@ -893,6 +938,7 @@ class Uploader:
         if status == 200:
             elapsed = time.time() - t0
             logger.info(f"Upload successful: {file_path.name} ({elapsed:.1f}s, {size / elapsed / 1024:.1f} KB/s)")
+            self._last_upload_ok = time.time()
             # A completed upload is the evidence that promotes a staged update out of probation.
             # It is checked here rather than anywhere earlier because this is the first moment
             # the entire chain — capture, disk, modem, bearer, server — is known to still work
@@ -1140,36 +1186,126 @@ class Uploader:
         except Exception as e:
             logger.error(f"SMS check error: {e}")
 
+    def _runtime_summary(self) -> str:
+        """Live state for an SMS STATUS reply. Never raises into the SMS path: a device that
+        cannot describe itself should still answer, even partially."""
+        bits = [f"bearer={'up' if self._bearer_ok else 'DOWN'}"]
+        try:
+            queued = sum(1 for p in self.outbox_dir.glob('*')
+                          if p.is_file() and not p.name.endswith(('.tmp', '.json'))
+                          and not p.name.endswith(THERMAL_SUFFIX))
+            bits.append(f'out={queued}')
+        except Exception:
+            bits.append('out=?')
+        if self._last_upload_ok:
+            bits.append(f'up={int((time.time() - self._last_upload_ok) / 60)}m')
+        else:
+            bits.append('up=never')
+        if self.updater:
+            try:
+                st = self.updater.load_state()
+                bits.append(f"upd={st.get('state', '?')}@{str(st.get('version'))[-15:]}")
+            except Exception:
+                bits.append('upd=?')
+        else:
+            bits.append('upd=off')
+        return ' '.join(bits)
+
+    def _retry_bearer(self) -> None:
+        """Try to bring the GPRS bearer back, with backoff.
+
+        Every third attempt re-runs `initialize()`, which sends ATZ — a modem left wedged by an
+        abrupt kill needs the reset, and retrying SAPBR against it forever would never clear it."""
+        now = time.time()
+        if now < self._bearer_retry_at:
+            return
+        self._bearer_attempts += 1
+        if self._bearer_attempts % 3 == 0:
+            logger.warning('Bearer still down — resetting the modem before the next attempt')
+            self.modem.initialize()
+        if self.modem.bearer_open():
+            logger.info(f'GPRS bearer recovered after {self._bearer_attempts} attempt(s)')
+            self._bearer_ok = True
+            self._bearer_attempts = 0
+            self._bearer_backoff = 15
+            return
+        self._bearer_backoff = min(self._bearer_backoff * 2, 300)
+        self._bearer_retry_at = now + self._bearer_backoff
+        logger.error(f'Bearer still down (attempt {self._bearer_attempts}), '
+                     f'next try in {self._bearer_backoff}s')
+
+    def _reload_update_config(self) -> None:
+        """Pick up `update_check_interval` and `update_enabled` from disk when they change.
+
+        Re-read rather than captured at startup so an SMS can retune them on a device that is
+        already in trouble — restarting the uploader to apply a setting is exactly the operation
+        you least want to rely on when it is the uploader you are trying to reach. Re-parsed only
+        when the file's mtime moves, so this costs a stat per cycle."""
+        try:
+            mtime = self._config_path.stat().st_mtime
+            if mtime == self._config_mtime:
+                return
+            self._config_mtime = mtime
+            cfg = json.loads(self._config_path.read_text())
+        except Exception:
+            return
+        interval = int(cfg.get('update_check_interval', DEFAULT_UPDATE_CHECK_S))
+        enabled = bool(cfg.get('update_enabled', True))
+        if interval != self.update_check_interval:
+            logger.info(f'Update check interval now {interval}s (was {self.update_check_interval}s)')
+            self.update_check_interval = interval
+        if enabled != self._update_enabled:
+            logger.warning(f'Self-update {"enabled" if enabled else "DISABLED"} by config change')
+            self._update_enabled = enabled
+
     def _maybe_update(self) -> None:
         """Check for a published update, at most once per `update_check_interval`.
 
-        Deliberately does not report an installed update back to the caller: `activate` restarts
-        this very process, so nothing after it in the loop is guaranteed to run."""
+        Installing one does not restart this process — `poll` returns True and the caller shuts
+        down cleanly so systemd restarts it, see Updater.RESTART_UNITS."""
         if not self.updater:
+            return
+        self._reload_update_config()
+        if not self._update_enabled:
             return
         now = time.time()
         if now - self._last_update_check < self.update_check_interval:
             return
         self._last_update_check = now
         try:
-            self.updater.poll(self.modem)
+            if self.updater.poll(self.modem):
+                # Exit through the normal shutdown path rather than letting the updater run
+                # `systemctl restart` on this very process. That was a SIGTERM to ourselves, which
+                # skipped the `finally` that closes the bearer and the serial port — leaving the
+                # modem in a state the restarted process could not always recover from, with no
+                # SMS either because it died before reaching the loop. systemd's Restart=always
+                # brings us back on the new code just the same.
+                global STOP_FLAG
+                logger.warning('Update installed — exiting cleanly for systemd to restart us')
+                STOP_FLAG = True
         except Exception:
             logger.exception('Update check failed — continuing to upload normally')
 
     def run(self):
         self.modem.open()
         try:
-            while not self.modem.initialize():
+            while not STOP_FLAG and not self.modem.initialize():
                 logger.info("Modem init failed, retrying in 15s...")
                 time.sleep(15)
 
-            if not self.modem.bearer_open():
-                logger.error("Could not open GPRS bearer — check APN settings")
-                sys.exit(1)
+            # A failed bearer used to `sys.exit(1)`, which with Restart=always turned a transient
+            # modem or coverage problem into a 30-second crash loop. Worse, it exited *before* the
+            # main loop, so SMS was never polled — the one channel that does not need GPRS went
+            # silent exactly when it was needed to diagnose why. Carry on without a bearer instead:
+            # uploads wait, SMS still answers, and the bearer is retried with backoff.
+            self._bearer_ok = self.modem.bearer_open()
+            if not self._bearer_ok:
+                logger.error("Could not open GPRS bearer — continuing so SMS still works, "
+                             "and retrying in the background")
 
-            logger.info("Uploader running.")
-            while True:
-                processed = self._process_oldest()
+            logger.info(f"Uploader running (bearer {'up' if self._bearer_ok else 'DOWN'}).")
+            while not STOP_FLAG:
+                processed = self._process_oldest() if self._bearer_ok else False
                 if self._link_failures:
                     self._recover_link()
                 else:
@@ -1179,8 +1315,11 @@ class Uploader:
                     # must never come at the expense of a backlog of captures.
                     if not processed:
                         self._maybe_update()
+                if not self._bearer_ok:
+                    self._retry_bearer()
                 time.sleep(2 if processed else self.poll_interval)
 
+            logger.info("Uploader stopping.")
         except KeyboardInterrupt:
             logger.info("Uploader stopped by user")
         except Exception as e:

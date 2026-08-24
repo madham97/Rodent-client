@@ -13,9 +13,11 @@ Usage:
 """
 
 import json
+import os
 import shutil
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -250,6 +252,75 @@ check('_extract_httpread returns nothing when the header is missing',
       SIM800._extract_httpread('OK\r\n') == '')
 check('_extract_httpread returns nothing when the length is unparseable',
       SIM800._extract_httpread('+HTTPREAD: ?\r\ndata\r\nOK\r\n') == '')
+
+
+# ── SMS STATUS must describe the device, not echo its config ──────────────────
+# This is the only channel that works without the GPRS bearer, so it is what you have left when
+# a device stops reporting. Answering with config read off disk told us nothing during exactly
+# such an outage.
+
+tmp_s = Path(tempfile.mkdtemp())
+for d in ('outbox', 'uploaded', 'failed'):
+    (tmp_s / d).mkdir()
+(tmp_s / 'client.json').write_text(json.dumps({'recording': {'mode': 'image_motion',
+                                                              'motion_threshold': 0.02}}))
+up_s = _uploader(tmp_s, update_enabled=False)
+(tmp_s / 'outbox' / 'image_1.jpg').write_text('x')
+(tmp_s / 'outbox' / 'image_2.jpg').write_text('x')
+(tmp_s / 'outbox' / 'image_2_thermal.png').write_text('x')   # rides along, not its own capture
+status = up_s._sms_handler.handle('STATUS')
+check('STATUS reports bearer state', 'bearer=' in status)
+check('STATUS reports the outbox depth', 'out=2' in status)
+check('STATUS counts a thermal half with its capture, not separately', 'out=3' not in status)
+check('STATUS reports time since the last upload', 'up=never' in status)
+check('STATUS reports the update state', 'upd=' in status)
+check('STATUS still reports the recording mode', 'mode=image_motion' in status)
+# The reply has to fit an SMS segment or it is split and half-delivered over a 2G link.
+check('STATUS fits one SMS segment', len(status) <= 160)
+
+# A broken runtime probe must not take the whole reply down — a device that cannot fully
+# describe itself should still answer.
+up_s._sms_handler._runtime = lambda: 1 / 0
+degraded = up_s._sms_handler.handle('STATUS')
+check('STATUS degrades rather than failing when the runtime probe raises',
+      'mode=image_motion' in degraded and 'rt-ERR' in degraded)
+
+shutil.rmtree(tmp_s, ignore_errors=True)
+
+
+# ── The update interval must be retunable without a restart ───────────────────
+# Restarting the uploader to apply a setting is exactly what you cannot rely on when it is the
+# uploader that is in trouble, so these two are re-read from disk rather than captured at startup.
+
+tmp_i = Path(tempfile.mkdtemp())
+for d in ('outbox', 'uploaded', 'failed'):
+    (tmp_i / d).mkdir()
+cfgp = tmp_i / 'client.json'
+cfgp.write_text(json.dumps({'update_check_interval': 7200, 'update_enabled': True}))
+up_i = _uploader(tmp_i, update_enabled=True, update_check_interval=7200)
+check('interval starts at the configured value', up_i.update_check_interval == 7200)
+
+# an SMS writes the file; the uploader must notice without being restarted
+up_i._sms_handler.handle('SET update_check_interval=600')
+os.utime(cfgp, (time.time() + 1, time.time() + 1))   # force a distinct mtime
+up_i._reload_update_config()
+check('interval is picked up live from disk', up_i.update_check_interval == 600)
+
+up_i._sms_handler.handle('SET update_enabled=false')
+os.utime(cfgp, (time.time() + 2, time.time() + 2))
+up_i._reload_update_config()
+check('self-update can be killed remotely', up_i._update_enabled is False)
+
+# and with it off, no check is attempted even when one is due
+up_i._last_update_check = 0.0
+up_i.updater = object()          # would explode if poll() were reached
+up_i._maybe_update()
+check('a disabled updater is never polled', True)
+
+check('SMS rejects a key not on the whitelist',
+      up_i._sms_handler.handle('SET install_dir=/tmp').startswith('ERR'))
+
+shutil.rmtree(tmp_i, ignore_errors=True)
 
 
 # ── Queue behaviour ───────────────────────────────────────────────────────────

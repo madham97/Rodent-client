@@ -174,6 +174,15 @@ def run():
     check('a different version is still accepted after a rollback',
           up.poll(StubModem(make_bundle({'pi-client/recorder.py': 'VERSION = "fixed"\n'}), version='fixed')))
 
+    # ── the updater must never restart the process it is running inside ──
+    # A `systemctl restart` on our own unit is a SIGTERM to ourselves: the bearer and serial port
+    # are never closed, and the device can come back unable to reach the network *or* answer SMS.
+    from updater import Updater as _U
+    check('restart_services does not touch the uploader',
+          'monitoring-pipeline-uploader' not in _U.RESTART_UNITS)
+    check('restart_services still restarts the recorder',
+          'monitoring-pipeline-recorder' in _U.RESTART_UNITS)
+
     # ── probation carries the deferral cap the watchdog reads ──
     up = new_updater(tmp / 'k', max_probation_s=12345)
     up.poll(StubModem(make_bundle({'pi-client/recorder.py': 'x = 1\n'})))

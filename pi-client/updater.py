@@ -290,14 +290,19 @@ class Updater:
             self.restart_services()
         return True
 
-    @staticmethod
-    def restart_services() -> None:
-        """Restart the recorder and uploader so the swapped-in code takes effect.
+    # The uploader is deliberately absent: this runs *inside* it, and `systemctl restart` on
+    # your own unit is a SIGTERM to yourself. The uploader has no chance to close the GPRS
+    # bearer or the serial port, and the modem can be left in a state the restarted process
+    # cannot recover from — with no SMS either, because it dies before reaching the loop that
+    # polls for it. `poll()` returns True instead, and the caller exits cleanly; Restart=always
+    # brings it back on the new code just the same. The watchdog, a separate process, still
+    # restarts both units directly.
+    RESTART_UNITS = ('monitoring-pipeline-recorder',)
 
-        The uploader restarts *itself* here, which is intentional: systemd brings it straight
-        back on the new code, and if the new code can't start, `Restart=always` plus the
-        watchdog's rollback is what recovers it."""
-        for unit in ('monitoring-pipeline-recorder', 'monitoring-pipeline-uploader'):
+    @classmethod
+    def restart_services(cls) -> None:
+        """Restart the *other* services so the swapped-in code takes effect."""
+        for unit in cls.RESTART_UNITS:
             try:
                 subprocess.run(['systemctl', 'restart', unit], check=False, timeout=30)
             except Exception as e:
@@ -306,8 +311,9 @@ class Updater:
     # ── the one call the uploader makes ──────────────────────────────────────
 
     def poll(self, modem) -> bool:
-        """Check for, fetch and install an update. Returns True if one was installed (in which
-        case this process is about to be restarted).
+        """Check for, fetch and install an update. Returns True if one was installed, which
+        obliges the caller to shut down cleanly so systemd restarts it on the new code — this
+        function will not do that for it, see RESTART_UNITS.
 
         Never raises into the upload loop: a broken update channel must not be able to stop the
         device doing its actual job."""

@@ -18,7 +18,7 @@
   "webp_compress": true,
   "webp_quality":  80,
   "update_enabled":        true,
-  "update_check_interval": 21600,
+  "update_check_interval": 7200,
   "update_probation_s":    21600,
   "update_max_probation_s": 86400,
   "install_dir":           "/opt/Rodent-client",
