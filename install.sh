@@ -98,9 +98,21 @@ echo "Directories ready."
 if ! python3 -m venv --help >/dev/null 2>&1; then
     apt-get install -y python3-venv
 fi
-python3 -m venv "$INSTALL_DIR/venv"
+# --system-site-packages: the recorder needs picamera2 (an apt package, python3-picamera2) for
+# its streaming capture path, and the thermal stack (smbus, spidev, gpiozero, senxor, cv2) is
+# installed system-wide (docs/thermal-camera-setup.md). A plain venv cannot import either: the
+# camera silently falls back to per-capture rpicam-still, and with thermal_enabled the thermal
+# thread dies on import and every capture is discarded as unsynced. Re-running the installer
+# rewrites pyvenv.cfg, so this also repairs a venv created by an older install.sh.
+python3 -m venv --system-site-packages "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --upgrade pip -q
 "$INSTALL_DIR/venv/bin/pip" install flask requests pyserial pillow -q
+if "$INSTALL_DIR/venv/bin/python3" -c "import picamera2" 2>/dev/null; then
+    echo "picamera2 available (streaming capture)."
+else
+    echo "Warning: picamera2 cannot be imported; the recorder will fall back to rpicam-still."
+    echo "         Check: $INSTALL_DIR/venv/bin/python3 -c \"import picamera2\"  (see README troubleshooting)"
+fi
 echo "Python environment ready."
 
 # ── Write client.json ──────────────────────────────────────────────────────────
