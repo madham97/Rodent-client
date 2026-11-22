@@ -25,7 +25,7 @@ The installer will prompt for:
 | Start services now | yes | Enables and starts all systemd services |
 
 The installer:
-- Installs Python dependencies into a venv at `/opt/Rodent-client/venv`
+- Installs Python dependencies into a venv at `/opt/Rodent-client/venv`, created with `--system-site-packages` so the recorder can import `picamera2` and the system-wide thermal libraries (a plain venv makes the camera fall back to `rpicam-still`, and makes thermal capture discard every frame)
 - Writes `/opt/Rodent-client/config/client.json` and `webui.env`
 - Frees the GPIO serial port (disables serial getty, removes kernel console — harmless if using USB mode)
 - Installs Tailscale for remote access
